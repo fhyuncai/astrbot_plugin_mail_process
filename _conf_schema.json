@@ -94,10 +94,64 @@
     "default": false,
     "hint": "启用后将调用 LLM 对邮件内容生成简洁摘要再推送"
   },
+  "enable_blacklist": {
+    "description": "启用黑名单过滤",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，命中发件人、主题或正文黑名单规则的邮件不会推送"
+  },
+  "enable_whitelist": {
+    "description": "启用白名单过滤",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，只有命中至少一条白名单规则的邮件才会推送"
+  },
+  "sender_blacklist": {
+    "description": "发件人黑名单",
+    "type": "list",
+    "default": [],
+    "hint": "支持完整邮箱、@域名后缀，或普通关键词包含匹配"
+  },
+  "sender_whitelist": {
+    "description": "发件人白名单",
+    "type": "list",
+    "default": [],
+    "hint": "支持完整邮箱、@域名后缀，或普通关键词包含匹配"
+  },
+  "subject_blacklist": {
+    "description": "主题黑名单",
+    "type": "list",
+    "default": [],
+    "hint": "使用不区分大小写的包含匹配"
+  },
+  "subject_whitelist": {
+    "description": "主题白名单",
+    "type": "list",
+    "default": [],
+    "hint": "使用不区分大小写的包含匹配"
+  },
+  "body_blacklist": {
+    "description": "正文黑名单",
+    "type": "list",
+    "default": [],
+    "hint": "使用不区分大小写的包含匹配"
+  },
+  "body_whitelist": {
+    "description": "正文白名单",
+    "type": "list",
+    "default": [],
+    "hint": "使用不区分大小写的包含匹配"
+  },
   "max_body_length": {
     "description": "邮件正文最大截取长度",
     "type": "int",
     "default": 500,
-    "hint": "截取邮件正文的最大字符数，用于预览或 AI 摘要输入"
+    "hint": "截取邮件正文的最大字符数，用于通知预览或 AI 摘要输入"
+  },
+  "filter_body_length": {
+    "description": "正文过滤最大长度",
+    "type": "int",
+    "default": 3000,
+    "hint": "正文黑白名单匹配时使用的最大字符数，会自动不低于通知预览长度"
   }
 }

@@ -14,7 +14,7 @@ from .smtp_client import smtp_send_mail
     "astrbot_plugin_mail_notify",
     "YourName",
     "监控邮箱新邮件并通过 QQ 私聊发送通知",
-    "1.2.2",
+    "1.3.0",
 )
 class MailNotifyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -68,7 +68,11 @@ class MailNotifyPlugin(Star):
     async def _check_account(self, account: dict, notify_umo: str):
         # 每个邮箱独立存储状态，避免冲突
         account_email = account["email"]
-        max_body_len = self.config.get("max_body_length", 500)
+        max_body_len = max(int(self.config.get("max_body_length", 500) or 500), 1)
+        filter_body_len = max(
+            int(self.config.get("filter_body_length", 3000) or 3000),
+            max_body_len,
+        )
 
         uid_key = f"last_uid_{account_email}"
         init_key = f"init_time_{account_email}"
@@ -83,7 +87,7 @@ class MailNotifyPlugin(Star):
 
         # imaplib为阻塞操作，实际查询在工作线程中执行
         new_emails, new_max_uid = await asyncio.to_thread(
-            imap_fetch_new, account, last_uid, max_body_len
+            imap_fetch_new, account, last_uid, max_body_len, filter_body_len
         )
 
         if new_max_uid > last_uid:
@@ -100,9 +104,99 @@ class MailNotifyPlugin(Star):
         for mail_info in new_emails:
             # 二次校验邮件时间，避免刚拉取的邮件属于历史存量
             if is_recent_email(mail_info, init_dt):
+                should_notify, reason = self._should_notify_mail(mail_info)
+                log_mail_from = (
+                    mail_info.get("from_addr") or mail_info.get("from_name") or "?"
+                )
+                log_mail_subject = (mail_info.get("subject") or "")[:120]
+                if not should_notify:
+                    logger.info(
+                        "MailNotify: filtered mail for account=%s, reason=%s, from=%s, subject=%s",
+                        account_email,
+                        reason,
+                        log_mail_from,
+                        log_mail_subject,
+                    )
+                    continue
+                logger.info(
+                    "MailNotify: notification allowed for account=%s, reason=%s, from=%s, subject=%s",
+                    account_email,
+                    reason,
+                    log_mail_from,
+                    log_mail_subject,
+                )
                 await self._send_notification(account, mail_info, notify_umo)
 
     # ── Notification ─────────────────────────────────────────────
+
+    def _get_filter_rules(self, config_key: str) -> list[str]:
+        values = self.config.get(config_key, []) or []
+        return [
+            str(value).strip()
+            for value in values
+            if isinstance(value, (str, int, float)) and str(value).strip()
+        ]
+
+    @staticmethod
+    def _matches_sender_rule(mail_info: dict, rule: str) -> bool:
+        normalized_rule = rule.strip().casefold()
+        if not normalized_rule:
+            return False
+
+        from_addr = (mail_info.get("from_addr") or "").strip().casefold()
+        from_name = (mail_info.get("from_name") or "").strip().casefold()
+
+        if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized_rule):
+            return from_addr == normalized_rule
+        if normalized_rule.startswith("@"):
+            return from_addr.endswith(normalized_rule)
+        return normalized_rule in from_addr or normalized_rule in from_name
+
+    @staticmethod
+    def _matches_contains_rule(text: str, rule: str) -> bool:
+        normalized_rule = rule.strip().casefold()
+        if not normalized_rule:
+            return False
+        return normalized_rule in (text or "").casefold()
+
+    def _match_rule_group(
+        self, mail_info: dict, prefix: str
+    ) -> tuple[bool, str | None]:
+        sender_rules = self._get_filter_rules(f"sender_{prefix}")
+        for rule in sender_rules:
+            if self._matches_sender_rule(mail_info, rule):
+                return True, f"sender:{rule}"
+
+        subject_rules = self._get_filter_rules(f"subject_{prefix}")
+        subject = mail_info.get("subject") or ""
+        for rule in subject_rules:
+            if self._matches_contains_rule(subject, rule):
+                return True, f"subject:{rule}"
+
+        body_rules = self._get_filter_rules(f"body_{prefix}")
+        filter_body = mail_info.get("filter_body") or mail_info.get("body") or ""
+        for rule in body_rules:
+            if self._matches_contains_rule(filter_body, rule):
+                return True, f"body:{rule}"
+
+        return False, None
+
+    def _should_notify_mail(self, mail_info: dict) -> tuple[bool, str]:
+        enable_blacklist = bool(self.config.get("enable_blacklist", False))
+        enable_whitelist = bool(self.config.get("enable_whitelist", False))
+
+        if enable_blacklist:
+            is_blacklisted, rule = self._match_rule_group(mail_info, "blacklist")
+            if is_blacklisted:
+                return False, f"被黑名单屏蔽 ({rule})"
+
+        if enable_whitelist:
+            is_whitelisted, rule = self._match_rule_group(mail_info, "whitelist")
+            if not is_whitelisted:
+                return False, "被白名单屏蔽"
+            return True, f"白名单允许 ({rule})"
+
+        return True, "允许，因为不需要匹配白名单限制"
 
     async def _send_notification(self, account: dict, mail_info: dict, notify_umo: str):
         account_name = account.get("name") or account["email"]
@@ -172,10 +266,7 @@ class MailNotifyPlugin(Star):
 
     def _get_admin_denied_message(self) -> str:
         if not self._get_admin_uids():
-            return (
-                "❌ 还未指定插件管理员。\n"
-                "请在插件web设置的admin_uid中添加用户id。"
-            )
+            return "❌ 还未指定插件管理员。\n请在插件web设置的admin_uid中添加用户id。"
         return "❌ 无权限使用该命令。"
 
     def _is_plugin_admin(self, event: AstrMessageEvent) -> bool:

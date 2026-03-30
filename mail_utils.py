@@ -3,7 +3,7 @@ from email.header import decode_header
 
 
 def decode_mime_header(value: str) -> str:
-    """Decode MIME encoded header value to plain string."""
+    """Decode a MIME encoded header value to plain text."""
     if not value:
         return ""
     parts = decode_header(value)
@@ -16,8 +16,15 @@ def decode_mime_header(value: str) -> str:
     return "".join(decoded)
 
 
-def extract_text_body(msg, max_length: int = 500) -> str:
-    """Extract plain text body from email message."""
+def truncate_text(value: str, max_length: int) -> str:
+    """Trim text to the configured preview length."""
+    if max_length <= 0 or len(value) <= max_length:
+        return value
+    return value[:max_length] + "..."
+
+
+def extract_text_body(msg) -> str:
+    """Extract plain text body content from an email message."""
     body = ""
     if msg.is_multipart():
         for part in msg.walk():
@@ -45,7 +52,4 @@ def extract_text_body(msg, max_length: int = 500) -> str:
                 text = re.sub(r"\s+", " ", text).strip()
             body = text
 
-    body = body.strip()
-    if len(body) > max_length:
-        body = body[:max_length] + "..."
-    return body
+    return body.strip()

@@ -3,7 +3,7 @@ import imaplib
 from datetime import datetime, timezone
 from email.utils import parseaddr, parsedate_to_datetime
 
-from .mail_utils import decode_mime_header, extract_text_body
+from .mail_utils import decode_mime_header, extract_text_body, truncate_text
 from .network_utils import open_tcp_socket
 
 # 本模块封装所有与 IMAP 服务器交互的同步操作。
@@ -95,16 +95,20 @@ def _connect(account: dict) -> imaplib.IMAP4 | imaplib.IMAP4_SSL:
     return conn
 
 
-def _parse_email(msg, uid: bytes, max_body_len: int) -> dict:
+def _parse_email(
+    msg, uid: bytes, preview_body_len: int, filter_body_len: int | None = None
+) -> dict:
     """将原始 email.message.Message 对象解析为结构化字典。
 
     Args:
         msg:         由 email.message_from_bytes() 解析得到的邮件对象。
         uid:         IMAP UID（bytes），用于去重与增量跟踪。
-        max_body_len: 正文截取的最大字符数。
+        preview_body_len: Maximum number of body characters used in notifications.
+        filter_body_len:  Maximum number of body characters used for filtering.
 
     Returns:
-        包含 uid、subject、from_name、from_addr、date、date_raw、body 的字典。
+        A dictionary containing uid, subject, from_name, from_addr, date,
+        date_raw, body, and filter_body.
     """
     # 解码 MIME 编码的主题（可能是 Base64 或 Quoted-Printable 编码的中文）
     subject = decode_mime_header(msg.get("Subject", ""))
@@ -126,7 +130,9 @@ def _parse_email(msg, uid: bytes, max_body_len: int) -> dict:
         date_raw = ""
 
     # 提取纯文本正文，优先 text/plain，降级到剥离标签的 text/html
-    body = extract_text_body(msg, max_body_len)
+    body = extract_text_body(msg)
+    preview_body = truncate_text(body, preview_body_len)
+    filter_text = truncate_text(body, filter_body_len or preview_body_len)
 
     return {
         "uid": int(uid),
@@ -135,12 +141,16 @@ def _parse_email(msg, uid: bytes, max_body_len: int) -> dict:
         "from_addr": from_addr,
         "date": date_formatted,
         "date_raw": date_raw,
-        "body": body,
+        "body": preview_body,
+        "filter_body": filter_text,
     }
 
 
 def imap_fetch_new(
-    account: dict, last_uid: int, max_body_len: int
+    account: dict,
+    last_uid: int,
+    preview_body_len: int,
+    filter_body_len: int | None = None,
 ) -> tuple[list[dict], int]:
     """基于 UID 增量拉取收件箱中的新邮件。同步函数，调用方应通过 asyncio.to_thread() 执行。
 
@@ -153,7 +163,8 @@ def imap_fetch_new(
     Args:
         account:      账户配置字典（imap_server、email、password 等）。
         last_uid:     上次成功处理的最大邮件 UID，存储于 KV 数据库（data/data_v4.db）。
-        max_body_len: 正文截取最大字符数。
+        preview_body_len: Maximum number of body characters used in notifications.
+        filter_body_len:  Maximum number of body characters used for filtering.
 
     Returns:
         (new_emails, new_max_uid)：新邮件列表 与 本次处理后的最大 UID。
@@ -195,7 +206,9 @@ def imap_fetch_new(
             if not isinstance(raw, bytes):
                 continue
             msg = email_lib.message_from_bytes(raw)
-            new_emails.append(_parse_email(msg, uid, max_body_len))
+            new_emails.append(
+                _parse_email(msg, uid, preview_body_len, filter_body_len)
+            )
     finally:
         # 无论成功或异常，确保 IMAP 连接被正常关闭
         try:
