@@ -129,8 +129,25 @@ class MailNotifyPlugin(Star):
 
     # ── Notification ─────────────────────────────────────────────
 
-    def _get_filter_rules(self, config_key: str) -> list[str]:
-        values = self.config.get(config_key, []) or []
+    def _get_filter_settings(self, prefix: str) -> dict:
+        settings = self.config.get(f"{prefix}_settings", {}) or {}
+        if isinstance(settings, dict):
+            return settings
+        return {}
+
+    def _get_filter_enabled(self, prefix: str) -> bool:
+        settings = self._get_filter_settings(prefix)
+        if "enable" in settings:
+            return bool(settings.get("enable", False))
+        return bool(self.config.get(f"enable_{prefix}", False))
+
+    def _get_filter_rules(self, prefix: str, field: str) -> list[str]:
+        settings = self._get_filter_settings(prefix)
+        nested_values = settings.get(f"{field}_rules", [])
+        if not nested_values:
+            nested_values = self.config.get(f"{field}_{prefix}", []) or []
+
+        values = nested_values or []
         return [
             str(value).strip()
             for value in values
@@ -162,18 +179,18 @@ class MailNotifyPlugin(Star):
     def _match_rule_group(
         self, mail_info: dict, prefix: str
     ) -> tuple[bool, str | None]:
-        sender_rules = self._get_filter_rules(f"sender_{prefix}")
+        sender_rules = self._get_filter_rules(prefix, "sender")
         for rule in sender_rules:
             if self._matches_sender_rule(mail_info, rule):
                 return True, f"sender:{rule}"
 
-        subject_rules = self._get_filter_rules(f"subject_{prefix}")
+        subject_rules = self._get_filter_rules(prefix, "subject")
         subject = mail_info.get("subject") or ""
         for rule in subject_rules:
             if self._matches_contains_rule(subject, rule):
                 return True, f"subject:{rule}"
 
-        body_rules = self._get_filter_rules(f"body_{prefix}")
+        body_rules = self._get_filter_rules(prefix, "body")
         filter_body = mail_info.get("filter_body") or mail_info.get("body") or ""
         for rule in body_rules:
             if self._matches_contains_rule(filter_body, rule):
@@ -182,8 +199,8 @@ class MailNotifyPlugin(Star):
         return False, None
 
     def _should_notify_mail(self, mail_info: dict) -> tuple[bool, str]:
-        enable_blacklist = bool(self.config.get("enable_blacklist", False))
-        enable_whitelist = bool(self.config.get("enable_whitelist", False))
+        enable_blacklist = self._get_filter_enabled("blacklist")
+        enable_whitelist = self._get_filter_enabled("whitelist")
 
         if enable_blacklist:
             is_blacklisted, rule = self._match_rule_group(mail_info, "blacklist")

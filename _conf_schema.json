@@ -12,13 +12,13 @@
             "description": "账户备注名",
             "type": "string",
             "default": "",
-            "hint": "例如：谷歌邮箱、杭电邮箱"
+            "hint": "例如：谷歌邮箱、QQ邮箱、工作邮箱"
           },
           "imap_server": {
             "description": "IMAP 服务器地址",
             "type": "string",
             "default": "",
-            "hint": "例如：imap.gmail.com、imap.hdu.edu.cn、imap.qq.com"
+            "hint": "例如：imap.gmail.com、imap.qq.com"
           },
           "imap_port": {
             "description": "IMAP 端口",
@@ -32,16 +32,16 @@
             "default": ""
           },
           "password": {
-            "description": "密码/应用专用密码",
+            "description": "密码或应用专用密码",
             "type": "string",
             "default": "",
-            "hint": "Gmail 需使用应用专用密码，QQ 邮箱需使用授权码"
+            "hint": "当邮箱服务要求时，请填写授权码或应用专用密码"
           },
           "smtp_server": {
             "description": "SMTP 服务器地址",
             "type": "string",
             "default": "",
-            "hint": "例如：smtp.gmail.com、smtp.qq.com、smtp.hdu.edu.cn"
+            "hint": "例如：smtp.gmail.com、smtp.qq.com"
           },
           "smtp_port": {
             "description": "SMTP 端口",
@@ -56,13 +56,13 @@
             "hint": "为 false 时将使用 STARTTLS"
           },
           "smtp_password": {
-            "description": "SMTP 密码/应用专用密码",
+            "description": "SMTP 密码或应用专用密码",
             "type": "string",
             "default": "",
-            "hint": "留空时默认使用上方 password 字段"
+            "hint": "留空时默认复用上方的 IMAP 密码"
           },
           "use_ssl": {
-            "description": "使用 SSL 连接",
+            "description": "IMAP 使用 SSL 连接",
             "type": "bool",
             "default": true
           }
@@ -77,81 +77,93 @@
     "hint": "每隔多少分钟检查一次新邮件，建议不低于 2 分钟"
   },
   "admin_uids": {
-    "description": "管理员列表",
+    "description": "管理员 UID 列表",
     "type": "list",
     "default": [],
-    "hint": "输入管理员qq号，微信号，飞书号..."
+    "hint": "只有列表中的用户可以使用插件命令"
   },
   "notify_umo": {
     "description": "通知目标会话 ID",
     "type": "string",
     "default": "",
-    "hint": "通过 /mail_bind 指令在 QQ 私聊中自动绑定，也可手动填写 unified_msg_origin"
+    "hint": "可以通过 /mail_bind 绑定，也可以手动填写 unified_msg_origin"
   },
   "ai_summary": {
     "description": "启用 AI 摘要",
     "type": "bool",
     "default": false,
-    "hint": "启用后将调用 LLM 对邮件内容生成简洁摘要再推送"
+    "hint": "启用后将先生成简短摘要，再发送邮件通知"
   },
-  "enable_blacklist": {
-    "description": "启用黑名单过滤",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后，命中发件人、主题或正文黑名单规则的邮件不会推送"
+  "blacklist_settings": {
+    "description": "黑名单设置",
+    "type": "object",
+    "items": {
+      "enable": {
+        "description": "启用黑名单过滤",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，命中发件人、主题或正文任意黑名单规则的邮件不会推送"
+      },
+      "sender_rules": {
+        "description": "发件人规则",
+        "type": "list",
+        "default": [],
+        "hint": "支持完整邮箱、@域名后缀，或普通关键词包含匹配"
+      },
+      "subject_rules": {
+        "description": "主题规则",
+        "type": "list",
+        "default": [],
+        "hint": "使用不区分大小写的包含匹配"
+      },
+      "body_rules": {
+        "description": "正文规则",
+        "type": "list",
+        "default": [],
+        "hint": "使用不区分大小写的包含匹配"
+      }
+    }
   },
-  "enable_whitelist": {
-    "description": "启用白名单过滤",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后，只有命中至少一条白名单规则的邮件才会推送"
-  },
-  "sender_blacklist": {
-    "description": "发件人黑名单",
-    "type": "list",
-    "default": [],
-    "hint": "支持完整邮箱、@域名后缀，或普通关键词包含匹配"
-  },
-  "sender_whitelist": {
-    "description": "发件人白名单",
-    "type": "list",
-    "default": [],
-    "hint": "支持完整邮箱、@域名后缀，或普通关键词包含匹配"
-  },
-  "subject_blacklist": {
-    "description": "主题黑名单",
-    "type": "list",
-    "default": [],
-    "hint": "使用不区分大小写的包含匹配"
-  },
-  "subject_whitelist": {
-    "description": "主题白名单",
-    "type": "list",
-    "default": [],
-    "hint": "使用不区分大小写的包含匹配"
-  },
-  "body_blacklist": {
-    "description": "正文黑名单",
-    "type": "list",
-    "default": [],
-    "hint": "使用不区分大小写的包含匹配"
-  },
-  "body_whitelist": {
-    "description": "正文白名单",
-    "type": "list",
-    "default": [],
-    "hint": "使用不区分大小写的包含匹配"
+  "whitelist_settings": {
+    "description": "白名单设置",
+    "type": "object",
+    "items": {
+      "enable": {
+        "description": "启用白名单过滤",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，只有命中至少一条白名单规则的邮件才会推送"
+      },
+      "sender_rules": {
+        "description": "发件人规则",
+        "type": "list",
+        "default": [],
+        "hint": "支持完整邮箱、@域名后缀，或普通关键词包含匹配"
+      },
+      "subject_rules": {
+        "description": "主题规则",
+        "type": "list",
+        "default": [],
+        "hint": "使用不区分大小写的包含匹配"
+      },
+      "body_rules": {
+        "description": "正文规则",
+        "type": "list",
+        "default": [],
+        "hint": "使用不区分大小写的包含匹配"
+      }
+    }
   },
   "max_body_length": {
-    "description": "邮件正文最大截取长度",
+    "description": "通知预览最大长度",
     "type": "int",
     "default": 500,
-    "hint": "截取邮件正文的最大字符数，用于通知预览或 AI 摘要输入"
+    "hint": "通知中展示的正文字符上限，也会用于 AI 摘要输入"
   },
   "filter_body_length": {
     "description": "正文过滤最大长度",
     "type": "int",
     "default": 3000,
-    "hint": "正文黑白名单匹配时使用的最大字符数，会自动不低于通知预览长度"
+    "hint": "用于正文黑白名单匹配的最大字符数"
   }
 }
