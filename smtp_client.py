@@ -2,6 +2,33 @@ import smtplib
 from email.message import EmailMessage
 from email.utils import formataddr, parseaddr
 
+from .network_utils import open_tcp_socket
+
+
+def _emit_debug_log(client: smtplib.SMTP, *args: object) -> None:
+    debug_printer = getattr(client, "_print_debug", None)
+    if client.debuglevel > 0 and callable(debug_printer):
+        debug_printer(*args)
+
+
+class _SMTPPreferredIPv4(smtplib.SMTP):
+    def _get_socket(self, host, port, timeout):
+        if timeout is not None and not timeout:
+            raise ValueError("Non-blocking socket (timeout=0) is not supported")
+        _emit_debug_log(self, "connect: to", (host, port), self.source_address)
+        return open_tcp_socket(
+            host, port, timeout=timeout, source_address=self.source_address
+        )
+
+
+class _SMTPSSLPreferredIPv4(smtplib.SMTP_SSL):
+    def _get_socket(self, host, port, timeout):
+        _emit_debug_log(self, "connect:", (host, port))
+        new_socket = open_tcp_socket(
+            host, port, timeout=timeout, source_address=self.source_address
+        )
+        return self.context.wrap_socket(new_socket, server_hostname=host)
+
 
 def _resolve_smtp_auth(account: dict) -> tuple[str, str]:
     email_addr = (account.get("email") or "").strip()
@@ -44,11 +71,11 @@ def smtp_send_mail(account: dict, to_addr: str, subject: str, body: str):
 
     try:
         if smtp_use_ssl:
-            with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=20) as server:
+            with _SMTPSSLPreferredIPv4(smtp_server, smtp_port, timeout=20) as server:
                 server.login(from_addr, password)
                 server.send_message(msg)
         else:
-            with smtplib.SMTP(smtp_server, smtp_port, timeout=20) as server:
+            with _SMTPPreferredIPv4(smtp_server, smtp_port, timeout=20) as server:
                 server.ehlo()
                 server.starttls()
                 server.ehlo()

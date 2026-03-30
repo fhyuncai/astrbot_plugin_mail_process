@@ -4,10 +4,22 @@ from datetime import datetime, timezone
 from email.utils import parseaddr, parsedate_to_datetime
 
 from .mail_utils import decode_mime_header, extract_text_body
+from .network_utils import open_tcp_socket
 
 # 本模块封装所有与 IMAP 服务器交互的同步操作。
 # 由于 imaplib 是阻塞式 I/O，调用方需通过 asyncio.to_thread() 在线程池中执行这些函数，
 # 避免阻塞 asyncio 事件循环。
+
+
+class _IMAP4PreferredIPv4(imaplib.IMAP4):
+    def _create_socket(self, timeout):
+        return open_tcp_socket(self.host, self.port, timeout=timeout)
+
+
+class _IMAP4SSLPreferredIPv4(imaplib.IMAP4_SSL):
+    def _create_socket(self, timeout):
+        sock = open_tcp_socket(self.host, self.port, timeout=timeout)
+        return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
 
 
 def is_recent_email(mail_info: dict, init_dt: datetime) -> bool:
@@ -54,9 +66,9 @@ def _connect(account: dict) -> imaplib.IMAP4 | imaplib.IMAP4_SSL:
 
     # 根据是否启用 SSL 选择对应的连接类，超时设置为 30 秒
     if use_ssl:
-        conn = imaplib.IMAP4_SSL(server, port, timeout=30)
+        conn = _IMAP4SSLPreferredIPv4(server, port, timeout=30)
     else:
-        conn = imaplib.IMAP4(server, port, timeout=30)
+        conn = _IMAP4PreferredIPv4(server, port, timeout=30)
 
     conn.login(account["email"], account["password"])
 
