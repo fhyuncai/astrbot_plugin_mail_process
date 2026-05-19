@@ -1,4 +1,5 @@
 import asyncio
+import json
 import re
 import uuid
 from datetime import datetime, timezone
@@ -6,7 +7,6 @@ from datetime import datetime, timezone
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
-from astrbot.core.agent.tool import ToolSet
 
 from .imap_client import imap_fetch_new, imap_query_since, is_recent_email
 from .smtp_client import smtp_send_mail
@@ -29,7 +29,6 @@ class MailProcessPlugin(Star):
         self._account_status: dict[str, str] = {}
         self._admin_session_map: dict[str, str] = {}
         self._pending_confirmations: dict[str, dict] = {}
-        self._ai_tool_states: dict[str, dict] = {}
 
     async def initialize(self):
         """插件初始化后启动后台邮件检查循环"""
@@ -226,11 +225,11 @@ class MailProcessPlugin(Star):
         if self.config.get("enable_ai_processing", False):
             ai_result = await self._run_ai_mail_processing(account, mail_info, notify_targets)
             if ai_result.get("notify"):
-                await self._send_notification(
+                await self._send_ai_notification(
                     account,
                     mail_info,
                     notify_targets,
-                    ai_decision=ai_result.get("reason", ""),
+                    ai_result=ai_result,
                 )
             return
         await self._send_notification(account, mail_info, notify_targets)
@@ -274,22 +273,16 @@ class MailProcessPlugin(Star):
         self, mail_info: dict, notify_umo: str, fallback: str
     ) -> str:
         try:
-            provider_id = await self.context.get_current_chat_provider_id(
-                umo=notify_umo
-            )
-            if not provider_id:
-                return fallback
             prompt = (
                 "请用简洁的中文（不超过100字）总结以下邮件内容，只输出摘要：\n"
                 f"主题：{mail_info['subject']}\n"
                 f"正文：{fallback}"
             )
-            llm_resp = await self.context.llm_generate(
-                chat_provider_id=provider_id,
-                prompt=prompt,
+            result = await self._generate_text_with_session_provider(
+                notify_umo, prompt
             )
-            if llm_resp and llm_resp.completion_text:
-                return llm_resp.completion_text
+            if result:
+                return result
         except Exception as e:
             logger.warning(f"MailProcess: AI summary failed: {e}")
         return fallback
@@ -343,10 +336,113 @@ class MailProcessPlugin(Star):
             await self.context.send_message(umo, chain)
             sent.add(umo)
 
-    def _build_mail_processing_prompt(self, account: dict, mail_info: dict) -> str:
-        default_prompt = (
-            "你收到了一封新邮件，请阅读后决定是否回复或通知。"
+    def _get_persona_prompt(self, unified_msg_origin: str) -> str:
+        try:
+            personality = self.context.persona_manager.get_default_persona_v3(
+                unified_msg_origin
+            )
+        except Exception:
+            return ""
+        if isinstance(personality, dict):
+            return str(personality.get("prompt", "") or "").strip()
+        return ""
+
+    async def _get_provider_for_session(self, unified_msg_origin: str):
+        provider_id = await self.context.get_current_chat_provider_id(
+            umo=unified_msg_origin
         )
+        if not provider_id:
+            return None
+        getter = getattr(self.context, "get_provider_by_id", None)
+        if callable(getter):
+            try:
+                return getter(provider_id)
+            except Exception:
+                pass
+        provider_manager = getattr(self.context, "provider_manager", None)
+        if provider_manager and hasattr(provider_manager, "get_provider_by_id"):
+            try:
+                return provider_manager.get_provider_by_id(provider_id)
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _extract_llm_text(llm_resp) -> str:
+        if not llm_resp:
+            return ""
+        if isinstance(llm_resp, str):
+            return MailProcessPlugin._extract_text_from_stream_payload(llm_resp)
+        completion_text = getattr(llm_resp, "completion_text", "")
+        if isinstance(completion_text, str):
+            stream_text = MailProcessPlugin._extract_text_from_stream_payload(
+                completion_text
+            )
+            return stream_text or completion_text.strip()
+        return ""
+
+    @staticmethod
+    def _extract_text_from_stream_payload(raw_text: str) -> str:
+        raw_text = (raw_text or "").strip()
+        if not raw_text:
+            return ""
+        if "data:" not in raw_text:
+            return raw_text
+
+        chunks: list[str] = []
+        for line in raw_text.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                data = json.loads(payload)
+            except Exception:
+                continue
+            for choice in data.get("choices", []) or []:
+                message = choice.get("message") or {}
+                delta = choice.get("delta") or {}
+                text = (
+                    message.get("content")
+                    or delta.get("content")
+                    or choice.get("text")
+                    or ""
+                )
+                if isinstance(text, list):
+                    for part in text:
+                        if isinstance(part, dict):
+                            value = part.get("text") or part.get("content") or ""
+                            if value:
+                                chunks.append(str(value))
+                elif text:
+                    chunks.append(str(text))
+
+        return "".join(chunks).strip()
+
+    async def _generate_text_with_session_provider(
+        self,
+        unified_msg_origin: str,
+        prompt: str,
+        system_prompt: str = "",
+    ) -> str:
+        provider = await self._get_provider_for_session(unified_msg_origin)
+        if not provider:
+            raise ValueError("未找到当前会话对应的聊天提供商。")
+        kwargs = {"prompt": prompt}
+        if system_prompt:
+            kwargs["system_prompt"] = system_prompt
+        llm_resp = await provider.text_chat(**kwargs)
+        text = self._extract_llm_text(llm_resp)
+        if not text:
+            raise ValueError("AI 返回内容为空。")
+        return text
+
+    def _build_mail_processing_prompt(
+        self, account: dict, mail_info: dict, unified_msg_origin: str
+    ) -> str:
+        default_prompt = "你收到了一封新邮件，请阅读后决定是否回复或通知。"
         base_prompt = (
             self.config.get("ai_processing_prompt", "") or default_prompt
         ).strip() or default_prompt
@@ -356,104 +452,219 @@ class MailProcessPlugin(Star):
         instructions = [
             base_prompt,
             "你正在处理一个邮箱插件的新邮件事件。",
+            "你必须只输出一个 JSON 对象，不要输出解释、Markdown 或代码块。",
+            (
+                '{"should_notify": false, "notify_reason": "", '
+                '"should_reply": false, "reply_to": "", "reply_subject": "", "reply_body": ""}'
+            ),
             f"当前邮箱账户: {account_name}",
             f"允许通知管理员: {'是' if notify_enabled else '否'}",
-            f"允许建议回复: {'是' if reply_enabled else '否'}",
-            "如果无需处理，请直接说明原因，不要调用工具。",
-            f"邮件发件人: {mail_info['from_name']} <{mail_info['from_addr']}>",
-            f"邮件主题: {mail_info['subject']}",
-            f"邮件时间: {mail_info['date']}",
-            f"邮件正文: {mail_info['body']}",
+            f"允许自动回复: {'是' if reply_enabled else '否'}",
+            "规则：",
+            "1. should_notify 表示是否需要通知管理员。",
+            "2. should_reply 表示是否需要立即自动回复原邮件。",
+            "3. 如果 should_reply 为 true，reply_to、reply_subject、reply_body 必须填写完整。",
+            "4. 如果无需通知或回复，请把对应字段置空或 false。",
+            "5. notify_reason 用一句简洁中文说明原因。",
         ]
-        if notify_enabled:
-            instructions.insert(
-                5, "如果你决定需要通知，请调用 notify_mail_admin 工具并提供简短原因。"
-            )
-        if reply_enabled:
-            instructions.insert(
-                6,
-                "如果你决定需要回复，请调用 send_mail_reply 工具生成一封待确认邮件。插件会在发送前请求管理员确认。",
-            )
+        instructions.extend(
+            [
+                f"邮件发件人: {mail_info['from_name']} <{mail_info['from_addr']}>",
+                f"邮件主题: {mail_info['subject']}",
+                f"邮件时间: {mail_info['date']}",
+                f"邮件正文: {mail_info['body']}",
+            ]
+        )
         return "\n".join(instructions)
+
+    @staticmethod
+    def _parse_ai_json(text: str) -> dict:
+        raw = (text or "").strip()
+        if not raw:
+            raise ValueError("AI 返回为空。")
+        candidates = [raw]
+        fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.S)
+        candidates.extend(fenced)
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidates.append(raw[start : end + 1])
+        for candidate in candidates:
+            try:
+                data = json.loads(candidate)
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                return data
+        raise ValueError(f"无法解析 AI JSON 输出: {raw[:200]}")
+
+    def _normalize_ai_mail_result(self, data: dict) -> dict:
+        return {
+            "notify": bool(data.get("should_notify", False)),
+            "reason": str(data.get("notify_reason", "") or "").strip(),
+            "reply": bool(data.get("should_reply", False)),
+            "reply_to": str(data.get("reply_to", "") or "").strip(),
+            "reply_subject": str(data.get("reply_subject", "") or "").strip(),
+            "reply_body": str(data.get("reply_body", "") or "").strip(),
+            "raw": data,
+        }
 
     async def _run_ai_mail_processing(
         self, account: dict, mail_info: dict, notify_targets: dict[str, str]
     ) -> dict:
-        provider_umo = next(iter(notify_targets.values()), "")
-        if not provider_umo:
+        decision_umo = next(iter(notify_targets.values()), "")
+        if not decision_umo:
             return {"notify": True, "reason": "未找到管理员会话，退回普通通知"}
         try:
-            provider_id = await self.context.get_current_chat_provider_id(
-                umo=provider_umo
+            prompt = self._build_mail_processing_prompt(account, mail_info, decision_umo)
+            raw_text = await self._generate_text_with_session_provider(
+                decision_umo, prompt
             )
-            if not provider_id:
-                return {"notify": True, "reason": "未找到聊天提供商，退回普通通知"}
-            tool_state_key = uuid.uuid4().hex
-            self._ai_tool_states[tool_state_key] = {"notify": False, "reply": False, "reason": ""}
-            tool_event = self._make_internal_event(
-                provider_umo, tool_state_key, notify_targets
-            )
-            prompt = self._build_mail_processing_prompt(account, mail_info)
-            tools = ToolSet()
-            func_tool_mgr = self.context.get_llm_tool_manager()
-            for tool_name in ("notify_mail_admin", "send_mail_reply"):
-                tool = func_tool_mgr.get_func(tool_name)
-                if tool:
-                    tools.add_tool(tool)
-            llm_resp = await self.context.tool_loop_agent(
-                event=tool_event,
-                chat_provider_id=provider_id,
-                prompt=prompt,
-                tools=tools,
-                system_prompt="你是邮件处理助手。根据工具约束决定是否通知或回复。",
-                max_steps=8,
-            )
-            state = self._ai_tool_states.pop(tool_state_key, {"notify": False, "reply": False, "reason": ""})
-            if not state.get("reason") and llm_resp and getattr(llm_resp, "completion_text", ""):
-                state["reason"] = llm_resp.completion_text.strip()
-            return state
+            parsed = self._parse_ai_json(raw_text)
+            result = self._normalize_ai_mail_result(parsed)
+            if result["reply"]:
+                try:
+                    payload = {
+                        "account_name": account.get("name")
+                        or account.get("email")
+                        or "",
+                        "to_addr": result["reply_to"] or mail_info.get("from_addr", ""),
+                        "subject": result["reply_subject"],
+                        "body": result["reply_body"],
+                    }
+                    payload["account_name"], payload["to_addr"], payload["subject"], payload[
+                        "body"
+                    ] = self._validate_reply_payload(
+                        payload["account_name"],
+                        payload["to_addr"],
+                        payload["subject"],
+                        payload["body"],
+                    )
+                    account_display, _ = await self._send_mail_payload(payload)
+                    result["reply_sent"] = True
+                    if not result["reason"]:
+                        result["reason"] = (
+                            f"AI 已自动回复。账户: {account_display}，收件人: {payload['to_addr']}"
+                        )
+                except Exception as e:
+                    logger.warning(f"MailProcess: auto reply failed: {e}")
+                    result["reply"] = False
+                    result["reply_sent"] = False
+                    result["notify"] = True
+                    result["reason"] = f"AI 判断需要处理，但自动回复失败: {e}"
+            return result
         except Exception as e:
             logger.warning(f"MailProcess: AI processing failed: {e}")
             return {"notify": True, "reason": f"AI处理失败，退回普通通知: {e}"}
 
-    def _make_internal_event(
-        self,
-        unified_msg_origin: str,
-        tool_state_key: str,
-        notify_targets: dict[str, str],
-    ):
-        class _InternalEvent:
-            def __init__(self, umo: str, state_key: str, targets: dict[str, str]):
-                self.unified_msg_origin = umo
-                self.message_str = ""
-                self.tool_state_key = state_key
-                self.notify_targets = targets
+    def _build_ai_notify_prompt(
+        self, account: dict, mail_info: dict, ai_result: dict, unified_msg_origin: str
+    ) -> str:
+        persona_prompt = self._get_persona_prompt(unified_msg_origin)
+        account_name = account.get("name") or account.get("email") or "未命名账户"
+        lines = [
+            "请像当前会话中的正常 AI 助手一样，向用户发送一条新消息。",
+            "你必须直接输出发给用户的正文，不要输出 JSON、代码块或额外解释。",
+            "这是一条由插件触发的邮件处理通知。",
+            f"邮箱账户: {account_name}",
+            f"邮件发件人: {mail_info['from_name']} <{mail_info['from_addr']}>",
+            f"邮件主题: {mail_info['subject']}",
+            f"邮件时间: {mail_info['date']}",
+            f"邮件正文摘要: {mail_info['body']}",
+            f"处理原因: {ai_result.get('reason', '')}",
+        ]
+        if ai_result.get("reply_sent"):
+            lines.append("这封邮件已经被 AI 自动回复，请明确告诉用户这一点。")
+        else:
+            lines.append("这封邮件目前尚未自动回复。")
+        if persona_prompt:
+            lines.append(f"请遵守当前会话人格设定: {persona_prompt}")
+        return "\n".join(lines)
 
-            def plain_result(self, text: str):
-                return text
+    def _build_conversation_mail_context(
+        self, account: dict, mail_info: dict, ai_result: dict
+    ) -> str:
+        account_name = account.get("name") or account.get("email") or "未命名账户"
+        lines = [
+            "[系统邮件事件]",
+            f"邮箱账户: {account_name}",
+            f"发件人: {mail_info['from_name']} <{mail_info['from_addr']}>",
+            f"主题: {mail_info['subject']}",
+            f"时间: {mail_info['date']}",
+            f"正文摘要: {mail_info['body']}",
+        ]
+        if ai_result.get("reply_sent"):
+            lines.append("处理结果: 已自动回复")
+        else:
+            lines.append("处理结果: 已通知用户")
+        if ai_result.get("reason"):
+            lines.append(f"处理原因: {ai_result['reason']}")
+        return "\n".join(lines)
 
-        return _InternalEvent(unified_msg_origin, tool_state_key, notify_targets)
-
-    def _update_ai_tool_state(
-        self,
-        event: AstrMessageEvent,
-        *,
-        notify: bool | None = None,
-        reply: bool | None = None,
-        reason: str | None = None,
+    async def _append_to_conversation(
+        self, unified_msg_origin: str, user_text: str, assistant_text: str
     ) -> None:
-        state_key = getattr(event, "tool_state_key", "")
-        if not state_key:
-            return
-        state = self._ai_tool_states.setdefault(
-            state_key, {"notify": False, "reply": False, "reason": ""}
-        )
-        if notify is not None:
-            state["notify"] = notify
-        if reply is not None:
-            state["reply"] = reply
-        if reason:
-            state["reason"] = str(reason).strip()
+        try:
+            from astrbot.core.agent.message import (
+                AssistantMessageSegment,
+                TextPart,
+                UserMessageSegment,
+            )
+
+            conv_mgr = self.context.conversation_manager
+            curr_cid = await conv_mgr.get_curr_conversation_id(unified_msg_origin)
+            if not curr_cid:
+                curr_cid = await conv_mgr.new_conversation(unified_msg_origin)
+            await conv_mgr.add_message_pair(
+                cid=curr_cid,
+                user_message=UserMessageSegment(content=[TextPart(text=user_text)]),
+                assistant_message=AssistantMessageSegment(
+                    content=[TextPart(text=assistant_text)]
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"MailProcess: append conversation failed: {e}")
+
+    async def _send_ai_notification(
+        self, account: dict, mail_info: dict, notify_targets: dict[str, str], ai_result: dict
+    ) -> None:
+        sent = set()
+        for unified_msg_origin in notify_targets.values():
+            if not unified_msg_origin or unified_msg_origin in sent:
+                continue
+            try:
+                provider_id = await self.context.get_current_chat_provider_id(
+                    umo=unified_msg_origin
+                )
+                if not provider_id:
+                    raise ValueError("未找到聊天提供商")
+                prompt = self._build_ai_notify_prompt(
+                    account, mail_info, ai_result, unified_msg_origin
+                )
+                notify_text = await self._generate_text_with_session_provider(
+                    unified_msg_origin,
+                    prompt,
+                    system_prompt=self._get_persona_prompt(unified_msg_origin),
+                )
+                if not notify_text:
+                    raise ValueError("AI 通知内容为空")
+                await self.context.send_message(
+                    unified_msg_origin, MessageChain().message(notify_text)
+                )
+                await self._append_to_conversation(
+                    unified_msg_origin,
+                    self._build_conversation_mail_context(account, mail_info, ai_result),
+                    notify_text,
+                )
+            except Exception as e:
+                logger.warning(f"MailProcess: AI notify failed for {unified_msg_origin}: {e}")
+                await self._send_notification(
+                    account,
+                    mail_info,
+                    {unified_msg_origin: unified_msg_origin},
+                    ai_decision=ai_result.get("reason", ""),
+                )
+            sent.add(unified_msg_origin)
 
     def _build_confirm_message(self, request_id: str, payload: dict) -> str:
         lines = [
@@ -482,6 +693,24 @@ class MailProcessPlugin(Star):
         else:
             await self.context.send_message(event.unified_msg_origin, chain)
         return request_id
+
+    async def _send_mail_payload(self, payload: dict) -> tuple[str, dict]:
+        account = self._get_account_by_name_or_email(payload["account_name"])
+        if not account:
+            raise ValueError("对应邮箱账户已不存在，无法发送。")
+        if not account.get("smtp_server"):
+            raise ValueError("该账户未配置 SMTP 服务器。")
+        await asyncio.to_thread(
+            smtp_send_mail,
+            account,
+            payload["to_addr"],
+            payload["subject"],
+            payload["body"],
+        )
+        account_display = (
+            account.get("name") or account.get("email") or payload["account_name"]
+        )
+        return account_display, account
 
     def _get_admin_denied_message(self) -> str:
         if not self._get_admin_uids():
@@ -671,27 +900,11 @@ class MailProcessPlugin(Star):
         if not payload:
             yield event.plain_result("❌ 未找到待确认的邮件请求。")
             return
-        account = self._get_account_by_name_or_email(payload["account_name"])
-        if not account:
-            yield event.plain_result("❌ 对应邮箱账户已不存在，无法发送。")
-            return
-        if not account.get("smtp_server"):
-            yield event.plain_result("❌ 该账户未配置 SMTP 服务器。")
-            return
         try:
-            await asyncio.to_thread(
-                smtp_send_mail,
-                account,
-                payload["to_addr"],
-                payload["subject"],
-                payload["body"],
-            )
+            account_display, _ = await self._send_mail_payload(payload)
         except Exception as e:
             yield event.plain_result(f"❌ 发送失败: {e}")
             return
-        account_display = (
-            account.get("name") or account.get("email") or payload["account_name"]
-        )
         yield event.plain_result(
             f"✅ 发送成功\n账户: {account_display}\n收件人: {payload['to_addr']}\n主题: {payload['subject']}"
         )
@@ -710,13 +923,14 @@ class MailProcessPlugin(Star):
 
     @filter.llm_tool(name="notify_mail_admin")
     async def notify_mail_admin(self, event: AstrMessageEvent, reason: str = ""):
+        """通知管理员。
+
+        Args:
+            reason(string): 通知管理员的原因
+        """
         if not self.config.get("ai_allow_notify", True):
-            self._update_ai_tool_state(
-                event, notify=False, reason="配置已禁用 AI 通知"
-            )
             return {"notify": False, "reason": "配置已禁用 AI 通知"}
         final_reason = (reason or "").strip() or "AI 判断需要通知管理员"
-        self._update_ai_tool_state(event, notify=True, reason=final_reason)
         return {
             "notify": True,
             "reason": final_reason,
@@ -731,29 +945,27 @@ class MailProcessPlugin(Star):
         subject: str,
         body: str,
     ):
+        """发送邮件。
+
+        Args:
+            account_name(string): 发送所用邮箱账户名或邮箱地址
+            to_addr(string): 收件人邮箱地址
+            subject(string): 邮件主题
+            body(string): 邮件正文
+        """
         if not self.config.get("ai_allow_reply", True):
-            self._update_ai_tool_state(
-                event, reply=False, reason="配置已禁用 AI 回复"
-            )
             return {"reply": False, "reason": "配置已禁用 AI 回复"}
         try:
             account_name, to_addr, subject, body = self._validate_reply_payload(
                 account_name, to_addr, subject, body
             )
         except ValueError as e:
-            self._update_ai_tool_state(event, reply=False, reason=str(e))
             return {"reply": False, "reason": str(e)}
 
         account = self._get_account_by_name_or_email(account_name)
         if not account:
-            self._update_ai_tool_state(
-                event, reply=False, reason=f"未找到邮箱账户: {account_name}"
-            )
             return {"reply": False, "reason": f"未找到邮箱账户: {account_name}"}
         if not account.get("smtp_server"):
-            self._update_ai_tool_state(
-                event, reply=False, reason="目标账户未配置 SMTP，无法回复"
-            )
             return {"reply": False, "reason": "目标账户未配置 SMTP，无法回复"}
 
         payload = {
@@ -763,15 +975,10 @@ class MailProcessPlugin(Star):
             "body": body,
         }
         request_id = await self._enqueue_confirmation(event, payload)
-        self._update_ai_tool_state(
-            event,
-            reply=True,
-            reason=f"已创建待确认回复，请管理员使用 /mail_confirm {request_id} 或 /mail_reject {request_id}",
-        )
         return {
             "reply": True,
             "notify": False,
-            "reason": f"已创建待确认回复，请管理员使用 /mail_confirm {request_id} 或 /mail_reject {request_id}",
+            "reason": f"已创建待确认邮件，请管理员使用 /mail_confirm {request_id} 或 /mail_reject {request_id}",
         }
 
     # ── Lifecycle ────────────────────────────────────────────────

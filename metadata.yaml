@@ -1,6 +1,6 @@
 name: astrbot_plugin_mail_process
 display_name: 📬 邮件通知
-desc: 监控邮箱新邮件并通过 AI 决策通知或发起回复，支持 Gmail、杭电邮箱等任何 IMAP 邮箱
+desc: 监控邮箱新邮件并通过 AI 决策通知或发起回复，支持任何 IMAP 邮箱
 version: v1.0.0
 author: gangcaiyoule
 repo: https://github.com/fhyuncai/astrbot_plugin_mail_process
