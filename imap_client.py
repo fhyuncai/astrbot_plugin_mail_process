@@ -76,7 +76,7 @@ def _connect(account: dict) -> imaplib.IMAP4 | imaplib.IMAP4_SSL:
     email_addr = account.get("email", "")
     if email_addr.endswith("@163.com") or email_addr.endswith("@126.com"):
         id_payload = (
-            '("name" "AstrBot-MailNotify" "version" "1.3.2" "vendor" "AstrBot")'
+            '("name" "AstrBot-MailProcess" "version" "1.3.2" "vendor" "AstrBot")'
         )
         try:
             conn.xatom("ID", id_payload)

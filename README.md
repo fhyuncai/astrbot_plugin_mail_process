@@ -1,313 +1,163 @@
 <div align="center">
 
-# 📬 邮件通知插件
+# 📬 邮件处理插件
 
-[![Plugin Version](https://img.shields.io/badge/Latest_Version-v1.3.2-blue.svg?style=for-the-badge&color=76bad9)](https://github.com/gangcaiyoule/astrbot_plugin_mail_notify)
+[![Plugin Version](https://img.shields.io/badge/Latest_Version-v1.0.0-blue.svg?style=for-the-badge&color=76bad9)](https://github.com/fhyuncai/astrbot_plugin_mail_process)
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-ff69b4?style=for-the-badge)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)](LICENSE)
 
-_✨ 监控多个 IMAP 邮箱的新邮件，通过 AstrBot 自动推送通知，支持 AI 智能摘要。✨_
+<img src="https://count.getloli.com/@astrbot-plugin-mail-process?name=astrbot-plugin-mail-process&theme=booru-jaypee&padding=6&offset=0&align=top&scale=1&pixelated=1&darkmode=auto" alt="count" />
 
-<img src="https://count.getloli.com/@astrbot-plugin-mail-notify?name=astrbot-plugin-mail-notify&theme=booru-jaypee&padding=6&offset=0&align=top&scale=1&pixelated=1&darkmode=auto" alt="count" />
+_✨ 监控多个 IMAP 邮箱的新邮件，支持 AI 自动判断是否通知管理员或发起回复。✨_
 
 </div>
 
-## ✨ 功能特性
+## 功能特性
 
-- **多邮箱监控** — 同时监控多个 IMAP 邮箱（Gmail、QQ 邮箱、163 邮箱、Outlook、校园邮箱等）
-- **自动推送** — 后台定时轮询（默认 5 分钟），收到新邮件时自动通过 QQ 私聊推送通知
-- **邮件摘要** — 通知包含发件人、主题、时间和正文预览
-- **AI 摘要**（可选）— 调用 LLM 对邮件内容生成简洁中文摘要
-- **手动查询** — 可按日期范围查询指定邮箱的历史邮件
-- **手动回复** — 在聊天里通过指令手动发送邮件回复（基于 SMTP）
-- **WebUI 配置** — 在 AstrBot 管理面板中可视化配置，无需修改代码
-- **智能过滤** — 只通知插件启用后收到的新邮件，不会推送历史旧邮件
-- **零额外依赖** — 使用 Python 标准库 `imaplib`、`smtplib` 和 `email`，无需安装第三方包
+- 多邮箱监控：同时监控多个 IMAP 邮箱
+- 自动推送：后台定时轮询新邮件
+- AI 邮件处理：可选把邮件交给 AI 决定是否通知、是否发起回复
+- AI 回复确认：AI 只能生成待确认回复，管理员确认后才真正发送
+- 历史查询：可按日期查询指定邮箱的历史邮件
+- 黑白名单过滤：支持按发件人、主题、正文过滤
+- WebUI 配置：全部配置项可在 AstrBot WebUI 管理
+- 零额外依赖：仅使用 Python 标准库
 
-## 📖 使用方法
+## 配置说明
 
-### 第一步：配置邮箱账户
+在 AstrBot WebUI 的插件配置中填写：
 
-在 AstrBot WebUI → 插件管理 → 📬 邮件通知 → 配置中，点击「邮箱账户列表」添加邮箱：
+### 邮箱账户
 
-| 字段 | 说明 | 示例 |
-|------|------|------|
-| 账户备注名 | 自定义名称，方便识别 | `qq邮箱` |
-| IMAP 服务器地址 | 邮箱的 IMAP 服务器 | `imap.qq.com` |
-| IMAP 端口 | SSL 通常为 993 | `993` |
-| 邮箱地址 | 你的邮箱地址 | `123456@qq.com` |
-| 密码/应用专用密码 | 见下方各邮箱获取方式 | `xxxxxxxxxxxxxxxx` |
-| SMTP 服务器地址 | 邮箱的 SMTP 服务器 | `smtp.qq.com` |
-| SMTP 端口 | SSL 常用 465，STARTTLS 常用 587 | `465` |
-| SMTP 使用 SSL 连接 | 推荐开启 | `true` |
-| SMTP 密码/应用专用密码 | 留空则复用上方密码字段 | `xxxxxxxxxxxxxxxx` |
-| 间隔时间 | 轮询间隔(分钟) | `60` |
-| 管理员UID列表 | 只有列表里的用户可以使用插件命令 | `QQ号/微信号` |
-| 通知目标会话ID | 建议通过/mail_bind自动绑定，也可以手动填写 | `test:GroupMessage:qq群号` |
-|  启用AI摘要 | 推荐开启 | `true` |
-| 使用 SSL 连接 | 推荐开启 | `true` |
-| 启用黑白名单过滤 | 自行启动 | `true` |
-| 发件人规则 | 可填写完整邮箱、域名后缀或关键词 | `qq.com` |
-| 主题规则 | 可填写关键字 | `广告` |
-| 正文规则 | 可填写关键字 | `广告` |
+每个账户需要配置：
 
-可添加多个邮箱账户，每个账户独立监控。
+- `name`：账户备注名
+- `imap_server` / `imap_port` / `use_ssl`
+- `email` / `password`
+- `smtp_server` / `smtp_port` / `smtp_use_ssl`
+- `smtp_password`：留空时复用 `password`
 
-### 第二步：绑定 QQ 通知目标
+### 通用配置
 
-在 QQ **私聊**中给机器人发送：
+- `check_interval`：轮询间隔，单位分钟
+- `admin_uids`：管理员 UID 列表
+- `max_body_length`：通知预览长度
+- `filter_body_length`：正文过滤长度
 
-```
-/mail_bind
+### AI 配置
+
+- `ai_summary`：仅做摘要，不做 AI 决策
+- `enable_ai_processing`：启用 AI 邮件处理
+- `ai_processing_prompt`：AI 处理提示词
+- `ai_allow_notify`：允许 AI 决定通知管理员
+- `ai_allow_reply`：允许 AI 发起回复
+
+默认 AI 处理提示词：
+
+```text
+你收到了一封新邮件，请阅读后决定是否回复或通知。
 ```
 
-机器人会回复"✅ 已绑定"，之后新邮件通知就会发到这个私聊。
+## 使用方式
 
-### 第三步使用：验证
+### 1. 管理员先建立可通知会话
 
-```
+插件现在不再使用 `/mail_bind`。
+
+通知目标改为基于 `admin_uids` 自动匹配管理员最近一次会话。也就是说：
+
+- 先在配置里填好管理员 UID
+- 每个需要接收通知的管理员，至少先给机器人发过一条消息
+- 插件会记录该管理员最近一次会话，并向该会话发送通知
+
+### 2. 手动检查
+
+```text
 /mail_check
 ```
 
-手动触发一次检查，确认邮箱连接正常。之后插件会自动后台轮询。
+### 3. 查看状态
 
-## 📋 指令列表
-
-| 指令 | 说明 | 示例 |
-|------|------|------|
-| `/mail_bind` | 绑定当前会话为邮件通知推送目标 | `/mail_bind` |
-| `/mail_check` | 立即手动检查所有邮箱的新邮件 | `/mail_check` |
-| `/mail_status` | 查看所有邮箱的连接状态和最近检查时间 | `/mail_status` |
-| `/mail_query` | 查询指定邮箱自某日期以来的邮件（最多 20 条） | `/mail_query qq邮箱 2026-03-01` |
-| `/mail_reply` | 使用指定账户手动发送邮件回复（管理员） | `/mail_reply qq邮箱 test@example.com 回复主题\|你好，已收到你的邮件。` |
-
-### `/mail_query` 用法详解
-
+```text
+/mail_status
 ```
+
+### 4. 查询历史邮件
+
+```text
 /mail_query <账户备注名> <起始日期>
 ```
 
-- `<账户备注名>`：你在配置中填写的名称，如 `qq邮箱`、`谷歌邮箱`
-- `<起始日期>`：格式为 `YYYY-MM-DD`，如 `2026-03-01`
-
 示例：
-```
+
+```text
 /mail_query qq邮箱 2026-03-01
 ```
 
-会返回该邮箱自 2026 年 3 月 1 日以来的邮件列表。
+## 指令列表
 
-### `/mail_reply` 用法详解
+| 指令 | 说明 |
+|------|------|
+| `/mail_check` | 立即检查所有邮箱 |
+| `/mail_status` | 查看邮箱状态和管理员会话覆盖情况 |
+| `/mail_query <账户> <YYYY-MM-DD>` | 查询历史邮件 |
+| `/mail_confirm <请求ID>` | 确认发送 AI 生成的回复 |
+| `/mail_reject <请求ID>` | 取消 AI 生成的回复 |
 
-```
-/mail_reply <账户备注名> <收件人邮箱> <主题>|<正文>
-```
+## AI 回复流程
 
-- `<账户备注名>`：你在配置中填写的名称，如 `qq邮箱`、`谷歌邮箱`
-- `<收件人邮箱>`：目标收件人邮箱地址
-- `<主题>|<正文>`：使用 `|` 分隔主题和正文，正文支持空格（`|`必须是英文半角竖线）
+启用 `enable_ai_processing` 后：
 
-示例：
-```
-/mail_reply qq邮箱 test@example.com 回复主题|你好，已收到你的邮件。
-```
+1. 插件收到新邮件
+2. 按你的 `ai_processing_prompt` 把邮件交给 AI
+3. AI 可以做两件事：
+   - 调用通知工具，要求插件通知管理员
+   - 调用回复工具，生成一封待确认邮件
+4. 如果 AI 发起回复，插件会把待发送内容发给管理员
+5. 管理员执行 `/mail_confirm <请求ID>` 后才真正通过 SMTP 发出
 
-> [!IMPORTANT]
-> `/mail_reply` 需要先配置对应邮箱的 SMTP 信息，且默认仅管理员可用。
+说明：
 
-## 🔑 各邮箱密码/授权码获取方式
+- 已移除手动 `/mail_reply` 指令
+- AI 回复前会被提示先询问用户是否确认发送
+- 若关闭 `ai_allow_reply`，AI 只能通知，不能发起回复
+- 若关闭 `ai_allow_notify`，AI 不能要求插件发通知
 
-> [!IMPORTANT]
-> 大多数邮箱不允许直接使用登录密码连接 IMAP，需要使用「应用专用密码」或「授权码」。
+## 邮件通知示例
 
-### Gmail（谷歌邮箱）
-
-Gmail **必须使用应用专用密码**，普通登录密码无法连接 IMAP。
-
-1. 前往 [Google 账户安全设置](https://myaccount.google.com/security)
-2. 确保已开启**两步验证**（2-Step Verification）
-   - 如未开启：安全性 → 两步验证 → 添加手机号 → 完成验证
-3. 开启两步验证后，前往 [应用专用密码页面](https://myaccount.google.com/apppasswords)
-4. 输入应用名称（如 `AstrBot`）→ 点击「创建」
-5. 复制生成的 **16 位密码**（如 `abcd efgh ijkl mnop`）
-6. 将此密码填入插件配置的密码字段（空格可去可不去）
-
-> [!TIP]
-> 应用专用密码只显示一次，关掉页面后无法再查看。如果忘了，删除后重新生成一个即可。
-
-> [!WARNING]
-> 在国内直连 `imap.gmail.com` 可能超时（被 GFW 屏蔽），需要代理或使用国内邮箱。
-
-### QQ 邮箱
-
-QQ 邮箱**必须使用授权码**，不能使用 QQ 密码。（只能在网页端操作）
-
-1. 登录 [QQ 邮箱网页版](https://mail.qq.com)
-2. 进入 **设置** → **账号**
-3. 找到「POP3/IMAP/SMTP/Exchange/CardDAV/CalDAV 服务」
-4. 若没开启，点击 **管理服务** 开启 **IMAP/SMTP 服务**
-5. 点击 **生成授权码**
-6. 按提示用手机发送短信验证
-7. 验证成功后会显示一个 **16 位授权码**
-8. 将此授权码填入插件配置的密码字段
-
-### 163 邮箱（网易邮箱）
-
-163 邮箱**必须使用授权码**。
-
-1. 登录 [163 邮箱网页版](https://mail.163.com)
-2. 进入 **设置** → **POP3/SMTP/IMAP**
-3. 开启 **IMAP/SMTP 服务**
-4. 按提示设置授权码（需要手机验证）
-5. 将授权码填入插件配置的密码字段
-
-### 杭电邮箱
-1. 登录 [数字杭电](https://i.hdu.edu.cn/)，从此进入邮箱
-2. 进入邮箱后点击 **设置**
-3. 点击 **账号与安全**
-4. 点击 **客户端设置**，点击 **进入设置**
-5. 打开 **客户端授权密码**，点击 **生成客户端授权密码**
-
-### Outlook / Hotmail（微软邮箱）
-
-Outlook 可以直接使用**账户登录密码**。
-
-- IMAP 服务器：`outlook.office365.com`
-- 端口：`993`
-- 密码：直接使用 Microsoft 账户密码
-
-> [!TIP]
-> 如果账户开启了两步验证，也需要生成应用密码：[Microsoft 应用密码](https://account.live.com/proofs/AppPassword)
-
-### 校园邮箱
-
-各学校邮箱配置不同，一般步骤：
-
-1. 登录学校邮箱网页版
-2. 在设置中确认是否开启了 IMAP 服务（部分学校默认关闭）
-3. 查找 IMAP 服务器地址（通常为 `imap.xxx.edu.cn`）
-4. 密码通常使用邮箱登录密码
-
-常见校园邮箱配置示例：
-
-| 学校 | IMAP 服务器 | 端口 |
-|------|------------|------|
-| 杭电 | `imap.hdu.edu.cn` | 993 |
-| 浙大 | `imap.zju.edu.cn` | 993 |
-
-> [!NOTE]
-> 如果连接失败，请联系学校信息中心确认是否开放了 IMAP 服务。
-
-<details>
-<summary><h2>🌐 国内服务器访问 Gmail 的解决方案</h2></summary>
-
-由于 GFW 屏蔽，国内服务器直连 `imap.gmail.com` 会超时。以下是两种解决方案：
-
-### 方案一：使用代理
-
-如果你的服务器上已经有代理客户端（如 Clash、v2rayA 等），开启 **TUN 模式** 或 **系统全局代理** 即可让 Python 的 IMAP 连接走代理。
-
-> [!WARNING]
-> 普通 HTTP/SOCKS5 代理对 `imaplib` 无效（它直接建立 TCP socket），必须使用 TUN 模式接管系统全部流量。
-
-### 方案二：Gmail 邮件转发到 QQ 邮箱
-
-不需要代理，将 Gmail 收到的邮件自动转发到 QQ 邮箱，然后只监控 QQ 邮箱即可。
-
-**设置步骤：**
-
-1. 在电脑上打开 [Gmail 网页版](https://mail.google.com)
-2. 点击右上角 ⚙️ → **查看所有设置**
-3. 进入 **「转发和 POP/IMAP」** 标签页
-4. 点击 **「添加转发地址」**，输入你的 QQ 邮箱地址
-5. 前往 QQ 邮箱收取确认邮件，点击确认链接或输入确认码
-6. 回到 Gmail 设置页面，选择 **「将收到的邮件转发到 xxx@qq.com」**
-7. 点击页面底部的**「保存更改」**
-
-> [!CAUTION]
-> 第 7 步「保存更改」很容易遗漏！不点保存则转发规则不会生效。
-
-设置完成后，所有发到 Gmail 的邮件都会自动转发到 QQ 邮箱，插件只需监控 QQ 邮箱即可收到通知。
-
-</details>
-
-## ⚙️ 其他配置项
-
-在 WebUI 插件配置中还可以调整：
-
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| 检查间隔（分钟） | 5 | 后台轮询间隔，建议不低于 2 分钟 |
-| 启用 AI 摘要 | 关闭 | 开启后使用 LLM 对邮件生成中文摘要 |
-| 邮件正文最大截取长度 | 500 | 预览或 AI 摘要输入的正文字符数上限 |
-
-## 📬 通知效果示例
-
-```
+```text
 📬 新邮件通知 [qq邮箱]
 ━━━━━━━━━━━━━━━━
 📤 发件人: 张三 <zhangsan@example.com>
 📋 主题: 关于项目进度汇报
 🕐 时间: 2026-03-07 14:30
+🤖 AI判断: 这是一封需要你关注的项目邮件
 📝 预览: 你好，本周项目已完成模块A的开发...
 ```
 
-开启 AI 摘要后：
+## 常见问题
 
-```
-📬 新邮件通知 [qq邮箱]
-━━━━━━━━━━━━━━━━
-📤 发件人: 张三 <zhangsan@example.com>
-📋 主题: 关于项目进度汇报
-🕐 时间: 2026-03-07 14:30
-📝 AI摘要: 通知项目进度：模块A已完成开发，下周将进入测试阶段。
-```
+**1. 为什么没有收到通知？**
 
-## 🔧 常见问题
+- 确认 `admin_uids` 已正确配置
+- 确认管理员至少先给机器人发过一条消息
+- 用 `/mail_status` 查看当前可通知管理员会话数量
 
-**Q: 连接超时 (timed out)？**
-- Gmail: 在国内被墙，需要代理或改用国内邮箱
-- 其他邮箱: 检查 IMAP 服务器地址和端口是否正确，确认邮箱已开启 IMAP 服务
+**2. 为什么 AI 没有发出回复？**
 
-**Q: 认证失败 (LOGIN failed)？**
-- 检查密码是否正确，Gmail 和 QQ 邮箱不能使用登录密码，必须使用应用专用密码/授权码
-- QQ 邮箱确认已开启 IMAP 服务
+- AI 只能创建待确认回复，不会直接发送
+- 需要管理员执行 `/mail_confirm <请求ID>`
+- 确认目标邮箱已配置 SMTP
 
-**Q: 收到了很多旧邮件通知？**
-- 插件已加入日期过滤机制，只通知启用后收到的新邮件。如仍有问题，在 WebUI 中重载插件即可
+**3. 连接超时或认证失败？**
 
-**Q: 后台不自动检查？**
-- 确认已通过 `/mail_bind` 绑定通知目标
-- 通过 `/mail_status` 查看状态
-
-**Q: `/mail_reply` 发送失败？**
-- 检查 SMTP 服务器、端口、SSL 配置是否正确
-- 检查 SMTP 密码/授权码是否可用（部分邮箱和 IMAP 不是同一凭据）
-- 确认收件人邮箱格式正确，主题与正文不为空
-
-## 📦 版本更新日志
-### v1.3
-- 添加黑白名单规则
-
-### v1.2
-- 兼容网易邮箱
-- 添加管理员列表，唯管理员有权限使用指令
-- 增加发邮件功能
-
-### v1.1
-- 支持多邮箱 IMAP 新邮件监控与自动通知
-- 支持 AI 摘要、手动检查、状态查看与历史查询
+- 检查 IMAP/SMTP 服务器地址和端口
+- Gmail、QQ、163 等通常需要授权码或应用专用密码
 
 ## 权限
 
-- 请先在web界面中配置“admin_uid”.
-- 唯有管理员有权使用指令.
-
-## 联系
-
-QQ: `964389211`
-
-如果本插件有bug或有建议，欢迎提出Issues和PRs，也可以直接联系作者qq。
+- 只有 `admin_uids` 中的用户可以使用插件命令
+- 只有管理员最近一次会话会被用于主动通知
 
 ## License
 

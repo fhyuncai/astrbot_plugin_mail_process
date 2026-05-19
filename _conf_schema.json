@@ -80,19 +80,37 @@
     "description": "管理员 UID 列表",
     "type": "list",
     "default": [],
-    "hint": "只有列表中的用户可以使用插件命令"
-  },
-  "notify_umo": {
-    "description": "通知目标会话 ID",
-    "type": "string",
-    "default": "",
-    "hint": "可以通过 /mail_bind 绑定，也可以手动填写 unified_msg_origin"
+    "hint": "只有列表中的用户可以使用插件命令，且插件会向这些管理员最近一次和机器人的会话发送通知"
   },
   "ai_summary": {
     "description": "启用 AI 摘要",
     "type": "bool",
     "default": false,
     "hint": "启用后将先生成简短摘要，再发送邮件通知"
+  },
+  "enable_ai_processing": {
+    "description": "启用 AI 邮件处理",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，新邮件会先交给 AI 判断是否需要通知管理员或发起回复"
+  },
+  "ai_processing_prompt": {
+    "description": "AI 邮件处理提示词",
+    "type": "string",
+    "default": "你收到了一封新邮件，请阅读后决定是否回复或通知。",
+    "hint": "会和邮件主题、发件人、正文等上下文一起发送给 AI"
+  },
+  "ai_allow_notify": {
+    "description": "允许 AI 通知管理员",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，AI 可以决定将邮件通知发给管理员"
+  },
+  "ai_allow_reply": {
+    "description": "允许 AI 发起回复",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，AI 可以生成待确认的邮件回复，管理员确认后才会发送"
   },
   "blacklist_settings": {
     "description": "黑名单设置",
