@@ -8,7 +8,12 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
-from .imap_client import imap_fetch_new, imap_query_since, is_recent_email
+from .imap_client import (
+    imap_fetch_new,
+    imap_query_recent,
+    imap_read_uid,
+    is_recent_email,
+)
 from .smtp_client import smtp_send_mail
 
 
@@ -29,6 +34,12 @@ class MailProcessPlugin(Star):
         self._account_status: dict[str, str] = {}
         self._admin_session_map: dict[str, str] = {}
         self._pending_confirmations: dict[str, dict] = {}
+        self._latest_pending_by_session: dict[str, str] = {}
+
+    def _is_send_mail_allowed(self) -> bool:
+        if "ai_allow_send_mail" in self.config:
+            return bool(self.config.get("ai_allow_send_mail", True))
+        return bool(self.config.get("ai_allow_reply", True))
 
     async def initialize(self):
         """插件初始化后启动后台邮件检查循环"""
@@ -43,23 +54,42 @@ class MailProcessPlugin(Star):
         while True:
             try:
                 interval = self.config.get("check_interval", 5)
+                accounts = self.config.get("mail_accounts", [])
                 admin_targets = await self._get_admin_notify_targets()
-                if admin_targets:
-                    accounts = self.config.get("mail_accounts", [])
-                    for account in accounts:
-                        if not account.get("email") or not account.get("imap_server"):
-                            continue
-                        try:
-                            await self._check_account(account, admin_targets)
-                            self._account_status[account["email"]] = "✅ 正常"
-                        except Exception as e:
-                            self._account_status[account["email"]] = f"❌ {str(e)[:80]}"
-                            logger.error(
-                                f"邮件通知插件：{account['email']} 检查失败: {e}"
-                            )
-                        self._last_check_time[account["email"]] = (
-                            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                for account in accounts:
+                    if not account.get("email") or not account.get("imap_server"):
+                        continue
+                    try:
+                        result = await self._check_account(account, admin_targets)
+                        pending_count = int(result.get("pending_count", 0) or 0)
+                        delivered_pending = int(
+                            result.get("delivered_pending_count", 0) or 0
                         )
+                        email_addr = account["email"]
+                        if not admin_targets:
+                            if pending_count > 0:
+                                self._account_status[email_addr] = (
+                                    f"⏸️ 已检测到 {pending_count} 封待处理邮件，等待管理员会话"
+                                )
+                            else:
+                                self._account_status[email_addr] = (
+                                    "✅ 已检查（当前无管理员会话）"
+                                )
+                        elif delivered_pending > 0:
+                            self._account_status[email_addr] = (
+                                f"✅ 正常（已补处理 {delivered_pending} 封待处理邮件）"
+                            )
+                        else:
+                            self._account_status[email_addr] = "✅ 正常"
+                    except Exception as e:
+                        self._account_status[account["email"]] = f"❌ {str(e)[:80]}"
+                        logger.error(
+                            f"邮件通知插件：{account['email']} 检查失败: {e}"
+                        )
+                    self._last_check_time[account["email"]] = (
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    )
                 await asyncio.sleep(max(interval, 1) * 60)
             except asyncio.CancelledError:
                 break
@@ -80,14 +110,21 @@ class MailProcessPlugin(Star):
 
         uid_key = f"last_uid_{account_email}"
         init_key = f"init_time_{account_email}"
+        pending_key = f"pending_mails_{account_email}"
         last_uid = await self.get_kv_data(uid_key, 0) or 0
         init_time = await self.get_kv_data(init_key, "")
+        delivered_pending_count = 0
 
         is_first_run = not init_time
         if is_first_run:
             # 首次运行记录初始化时间和当前UID基线，防止历史邮件被推送
             init_time = datetime.now(timezone.utc).isoformat()
             await self.put_kv_data(init_key, init_time)
+
+        if notify_targets:
+            delivered_pending_count = await self._flush_pending_mails(
+                account, pending_key, notify_targets
+            )
 
         # imaplib为阻塞操作，实际查询在工作线程中执行
         new_emails, new_max_uid = await asyncio.to_thread(
@@ -102,9 +139,14 @@ class MailProcessPlugin(Star):
                 logger.info(
                     f"邮件通知插件：{account_email} 初始化完成，最大UID = {new_max_uid}"
                 )
-            return
+            pending_count = len(await self.get_kv_data(pending_key, []) or [])
+            return {
+                "pending_count": pending_count,
+                "delivered_pending_count": delivered_pending_count,
+            }
 
         init_dt = datetime.fromisoformat(init_time)
+        matched_mails = []
         for mail_info in new_emails:
             # 二次校验邮件时间，避免刚拉取的邮件属于历史存量
             if is_recent_email(mail_info, init_dt):
@@ -129,7 +171,96 @@ class MailProcessPlugin(Star):
                     log_mail_from,
                     log_mail_subject,
                 )
+                matched_mails.append(mail_info)
+
+        if not notify_targets:
+            pending_count = await self._queue_pending_mails(
+                pending_key, matched_mails, account_email
+            )
+            return {
+                "pending_count": pending_count,
+                "delivered_pending_count": delivered_pending_count,
+            }
+
+        for mail_info in matched_mails:
+            await self._handle_incoming_mail(account, mail_info, notify_targets)
+
+        pending_count = len(await self.get_kv_data(pending_key, []) or [])
+        return {
+            "pending_count": pending_count,
+            "delivered_pending_count": delivered_pending_count,
+        }
+
+    async def _queue_pending_mails(
+        self, pending_key: str, mails: list[dict], account_email: str
+    ) -> int:
+        pending_mails = await self.get_kv_data(pending_key, []) or []
+        merged: dict[int, dict] = {}
+        for item in pending_mails:
+            if isinstance(item, dict):
+                try:
+                    merged[int(item.get("uid", 0))] = item
+                except Exception:
+                    continue
+
+        for mail_info in mails:
+            if not isinstance(mail_info, dict):
+                continue
+            try:
+                merged[int(mail_info.get("uid", 0))] = mail_info
+            except Exception:
+                continue
+
+        merged_list = [merged[uid] for uid in sorted(merged.keys()) if uid > 0][-50:]
+        await self.put_kv_data(pending_key, merged_list)
+        if mails:
+            logger.info(
+                "MailProcess: queued %s mail(s) for account=%s because no admin session is available",
+                len(mails),
+                account_email,
+            )
+        return len(merged_list)
+
+    async def _flush_pending_mails(
+        self, account: dict, pending_key: str, notify_targets: dict[str, str]
+    ) -> int:
+        pending_mails = await self.get_kv_data(pending_key, []) or []
+        if not pending_mails:
+            return 0
+
+        remaining = []
+        delivered_count = 0
+        account_email = account.get("email") or account.get("name") or "?"
+        for mail_info in pending_mails:
+            if not isinstance(mail_info, dict):
+                continue
+            try:
                 await self._handle_incoming_mail(account, mail_info, notify_targets)
+                delivered_count += 1
+            except Exception as e:
+                logger.warning(
+                    "MailProcess: failed to flush pending mail for account=%s uid=%s: %s",
+                    account_email,
+                    mail_info.get("uid", "?"),
+                    e,
+                )
+                remaining.append(mail_info)
+
+        await self.put_kv_data(pending_key, remaining)
+        if delivered_count:
+            logger.info(
+                "MailProcess: flushed %s pending mail(s) for account=%s",
+                delivered_count,
+                account_email,
+            )
+        return delivered_count
+
+    async def _get_pending_count(self, account_email: str) -> int:
+        pending_key = f"pending_mails_{account_email}"
+        pending_mails = await self.get_kv_data(pending_key, []) or []
+        if not isinstance(pending_mails, list):
+            return 0
+        return len([item for item in pending_mails if isinstance(item, dict)])
 
     # ── Notification ─────────────────────────────────────────────
 
@@ -224,6 +355,14 @@ class MailProcessPlugin(Star):
     ):
         if self.config.get("enable_ai_processing", False):
             ai_result = await self._run_ai_mail_processing(account, mail_info, notify_targets)
+            logger.info(
+                "MailProcess: AI decision account=%s notify=%s send_mail=%s reason=%s subject=%s",
+                account.get("email") or account.get("name") or "?",
+                ai_result.get("notify"),
+                ai_result.get("send_mail"),
+                ai_result.get("reason", "")[:120],
+                (mail_info.get("subject") or "")[:120],
+            )
             if ai_result.get("notify"):
                 await self._send_ai_notification(
                     account,
@@ -297,6 +436,67 @@ class MailProcessPlugin(Star):
                 return acc
         return None
 
+    def _list_mail_accounts(self) -> list[dict]:
+        accounts = self.config.get("mail_accounts", []) or []
+        return [
+            acc
+            for acc in accounts
+            if isinstance(acc, dict) and acc.get("email") and acc.get("imap_server")
+        ]
+
+    def _resolve_account_for_query(
+        self, account_name: str = "", allow_default: bool = True
+    ) -> tuple[dict | None, str | None]:
+        accounts = self._list_mail_accounts()
+        if not accounts:
+            return None, "未配置任何可查询的邮箱账户。"
+
+        normalized_name = (account_name or "").strip()
+        if normalized_name:
+            account = self._get_account_by_name_or_email(normalized_name)
+            if not account:
+                available_accounts = ", ".join(
+                    (acc.get("name") or acc.get("email") or "?") for acc in accounts
+                )
+                return (
+                    None,
+                    f"未找到邮箱账户: {normalized_name}。当前可用账户: {available_accounts}",
+                )
+            if not account.get("imap_server"):
+                return None, f"邮箱账户 {normalized_name} 未配置 IMAP，无法查询。"
+            return account, None
+
+        if allow_default and len(accounts) == 1:
+            return accounts[0], None
+
+        available_accounts = ", ".join(
+            (acc.get("name") or acc.get("email") or "?") for acc in accounts
+        )
+        return (
+            None,
+            "当前配置了多个邮箱账户，请明确指定 account_name。"
+            f"可用账户: {available_accounts}",
+        )
+
+    @staticmethod
+    def _normalize_mail_preview(mail_info: dict) -> dict:
+        return {
+            "uid": int(mail_info.get("uid", 0) or 0),
+            "subject": str(mail_info.get("subject", "") or "").strip(),
+            "from_name": str(mail_info.get("from_name", "") or "").strip(),
+            "from_addr": str(mail_info.get("from_addr", "") or "").strip(),
+            "date": str(mail_info.get("date", "") or "").strip(),
+            "summary": str(mail_info.get("body", "") or "").strip(),
+        }
+
+    def _get_mail_query_page_size(self) -> int:
+        configured = int(self.config.get("mail_query_page_size", 10) or 10)
+        return max(1, min(configured, 20))
+
+    def _get_mail_query_max_items(self) -> int:
+        configured = int(self.config.get("mail_query_max_items", 50) or 50)
+        return max(1, min(configured, 100))
+
     def _get_admin_uids(self) -> set[str]:
         admin_uids = self.config.get("admin_uids", []) or []
         return {
@@ -336,18 +536,78 @@ class MailProcessPlugin(Star):
             await self.context.send_message(umo, chain)
             sent.add(umo)
 
-    def _get_persona_prompt(self, unified_msg_origin: str) -> str:
+    def _get_personality(self, unified_msg_origin: str):
         try:
-            personality = self.context.persona_manager.get_default_persona_v3(
+            return self.context.persona_manager.get_default_persona_v3(
                 unified_msg_origin
             )
         except Exception:
-            return ""
+            return None
+
+    def _get_persona_prompt(self, unified_msg_origin: str) -> str:
+        personality = self._get_personality(unified_msg_origin)
         if isinstance(personality, dict):
             return str(personality.get("prompt", "") or "").strip()
+        for attr in ("prompt", "system_prompt"):
+            value = getattr(personality, attr, "")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
         return ""
 
+    def _get_persona_begin_dialogs(self, unified_msg_origin: str) -> list[str]:
+        personality = self._get_personality(unified_msg_origin)
+        dialogs = []
+        if isinstance(personality, dict):
+            dialogs = personality.get("begin_dialogs", []) or []
+        else:
+            dialogs = getattr(personality, "begin_dialogs", []) or []
+        return [str(item).strip() for item in dialogs if str(item).strip()]
+
+    @staticmethod
+    def _merge_stream_text(current: str, new_text: str) -> str:
+        current = current or ""
+        new_text = (new_text or "").strip()
+        if not new_text:
+            return current
+        if not current:
+            return new_text
+        if new_text == current:
+            return current
+        if new_text.startswith(current) or current in new_text:
+            return new_text
+        if current.startswith(new_text) or new_text in current:
+            return current
+
+        max_overlap = min(len(current), len(new_text))
+        for size in range(max_overlap, 0, -1):
+            if current.endswith(new_text[:size]):
+                return current + new_text[size:]
+
+        import difflib
+
+        similarity = difflib.SequenceMatcher(None, current, new_text).ratio()
+        if similarity >= 0.75:
+            return new_text if len(new_text) >= len(current) else current
+
+        return current + new_text
+
     async def _get_provider_for_session(self, unified_msg_origin: str):
+        getter = getattr(self.context, "get_using_provider", None)
+        if callable(getter):
+            try:
+                provider = getter(umo=unified_msg_origin)
+                if provider is not None:
+                    return provider
+            except TypeError:
+                try:
+                    provider = getter(unified_msg_origin)
+                    if provider is not None:
+                        return provider
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
         provider_id = await self.context.get_current_chat_provider_id(
             umo=unified_msg_origin
         )
@@ -373,12 +633,25 @@ class MailProcessPlugin(Star):
             return ""
         if isinstance(llm_resp, str):
             return MailProcessPlugin._extract_text_from_stream_payload(llm_resp)
+        if isinstance(llm_resp, dict):
+            if "text" in llm_resp and isinstance(llm_resp["text"], str):
+                return llm_resp["text"].strip()
+            if "content" in llm_resp and isinstance(llm_resp["content"], str):
+                return llm_resp["content"].strip()
         completion_text = getattr(llm_resp, "completion_text", "")
         if isinstance(completion_text, str):
             stream_text = MailProcessPlugin._extract_text_from_stream_payload(
                 completion_text
             )
             return stream_text or completion_text.strip()
+        for attr in ("text", "content", "delta", "message"):
+            value = getattr(llm_resp, attr, "")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, dict):
+                nested = value.get("text") or value.get("content") or ""
+                if isinstance(nested, str) and nested.strip():
+                    return nested.strip()
         return ""
 
     @staticmethod
@@ -433,6 +706,16 @@ class MailProcessPlugin(Star):
         kwargs = {"prompt": prompt}
         if system_prompt:
             kwargs["system_prompt"] = system_prompt
+        stream_fn = getattr(provider, "text_chat_stream", None)
+        if callable(stream_fn):
+            merged_text = ""
+            async for chunk in stream_fn(**kwargs):
+                text = self._extract_llm_text(chunk)
+                if text:
+                    merged_text = self._merge_stream_text(merged_text, text)
+            merged_text = merged_text.strip()
+            if merged_text:
+                return merged_text
         llm_resp = await provider.text_chat(**kwargs)
         text = self._extract_llm_text(llm_resp)
         if not text:
@@ -446,27 +729,37 @@ class MailProcessPlugin(Star):
         base_prompt = (
             self.config.get("ai_processing_prompt", "") or default_prompt
         ).strip() or default_prompt
+        persona_prompt = self._get_persona_prompt(unified_msg_origin)
+        begin_dialogs = self._get_persona_begin_dialogs(unified_msg_origin)
         notify_enabled = bool(self.config.get("ai_allow_notify", True))
-        reply_enabled = bool(self.config.get("ai_allow_reply", True))
+        send_mail_enabled = self._is_send_mail_allowed()
         account_name = account.get("name") or account.get("email") or "未命名账户"
         instructions = [
             base_prompt,
-            "你正在处理一个邮箱插件的新邮件事件。",
+            "你现在要以当前会话中的 AI 助手身份处理一封新邮件。",
+            "你不是在写说明文档，也不是在扮演插件；请按当前会话的人格、语气、偏好和判断标准来决定是否需要通知用户，或是否需要直接发送邮件。",
             "你必须只输出一个 JSON 对象，不要输出解释、Markdown 或代码块。",
             (
                 '{"should_notify": false, "notify_reason": "", '
-                '"should_reply": false, "reply_to": "", "reply_subject": "", "reply_body": ""}'
+                '"should_send_mail": false, "mail_to": "", "mail_subject": "", "mail_body": ""}'
             ),
             f"当前邮箱账户: {account_name}",
             f"允许通知管理员: {'是' if notify_enabled else '否'}",
-            f"允许自动回复: {'是' if reply_enabled else '否'}",
+            f"允许发送邮件: {'是' if send_mail_enabled else '否'}",
             "规则：",
             "1. should_notify 表示是否需要通知管理员。",
-            "2. should_reply 表示是否需要立即自动回复原邮件。",
-            "3. 如果 should_reply 为 true，reply_to、reply_subject、reply_body 必须填写完整。",
+            "2. should_send_mail 表示是否需要立即发送邮件，通常用于自动回复当前邮件。",
+            "3. 如果 should_send_mail 为 true，mail_to、mail_subject、mail_body 必须填写完整。",
             "4. 如果无需通知或回复，请把对应字段置空或 false。",
             "5. notify_reason 用一句简洁中文说明原因。",
+            "6. 判断时要结合当前人格风格与用户体验，不要机械地见到邮件就通知。",
+            "7. 如果邮件明显是广告、垃圾、无关提醒，通常不通知也不发信。",
         ]
+        if persona_prompt:
+            instructions.append(f"当前会话人格设定: {persona_prompt}")
+        if begin_dialogs:
+            instructions.append("当前会话说话风格参考:")
+            instructions.extend(begin_dialogs[:8])
         instructions.extend(
             [
                 f"邮件发件人: {mail_info['from_name']} <{mail_info['from_addr']}>",
@@ -489,11 +782,46 @@ class MailProcessPlugin(Star):
         end = raw.rfind("}")
         if start != -1 and end != -1 and end > start:
             candidates.append(raw[start : end + 1])
+
+        decoder = json.JSONDecoder()
+        json_objects: list[dict] = []
         for candidate in candidates:
+            stripped = candidate.strip()
             try:
-                data = json.loads(candidate)
+                data = json.loads(stripped)
             except Exception:
+                data = None
+            if isinstance(data, dict):
+                json_objects.append(data)
                 continue
+
+            idx = 0
+            length = len(stripped)
+            while idx < length:
+                brace_pos = stripped.find("{", idx)
+                if brace_pos == -1:
+                    break
+                try:
+                    obj, end_pos = decoder.raw_decode(stripped, brace_pos)
+                except Exception:
+                    idx = brace_pos + 1
+                    continue
+                if isinstance(obj, dict):
+                    json_objects.append(obj)
+                idx = end_pos
+
+        preferred_keys = {
+            "should_notify",
+            "notify_reason",
+            "should_send_mail",
+            "mail_to",
+            "mail_subject",
+            "mail_body",
+        }
+        for data in reversed(json_objects):
+            if preferred_keys.intersection(data.keys()):
+                return data
+        for data in reversed(json_objects):
             if isinstance(data, dict):
                 return data
         raise ValueError(f"无法解析 AI JSON 输出: {raw[:200]}")
@@ -502,10 +830,18 @@ class MailProcessPlugin(Star):
         return {
             "notify": bool(data.get("should_notify", False)),
             "reason": str(data.get("notify_reason", "") or "").strip(),
-            "reply": bool(data.get("should_reply", False)),
-            "reply_to": str(data.get("reply_to", "") or "").strip(),
-            "reply_subject": str(data.get("reply_subject", "") or "").strip(),
-            "reply_body": str(data.get("reply_body", "") or "").strip(),
+            "send_mail": bool(
+                data.get("should_send_mail", data.get("should_reply", False))
+            ),
+            "mail_to": str(
+                data.get("mail_to", data.get("reply_to", "")) or ""
+            ).strip(),
+            "mail_subject": str(
+                data.get("mail_subject", data.get("reply_subject", "")) or ""
+            ).strip(),
+            "mail_body": str(
+                data.get("mail_body", data.get("reply_body", "")) or ""
+            ).strip(),
             "raw": data,
         }
 
@@ -518,19 +854,21 @@ class MailProcessPlugin(Star):
         try:
             prompt = self._build_mail_processing_prompt(account, mail_info, decision_umo)
             raw_text = await self._generate_text_with_session_provider(
-                decision_umo, prompt
+                decision_umo,
+                prompt,
+                system_prompt=self._get_persona_prompt(decision_umo),
             )
             parsed = self._parse_ai_json(raw_text)
             result = self._normalize_ai_mail_result(parsed)
-            if result["reply"]:
+            if result["send_mail"]:
                 try:
                     payload = {
                         "account_name": account.get("name")
                         or account.get("email")
                         or "",
-                        "to_addr": result["reply_to"] or mail_info.get("from_addr", ""),
-                        "subject": result["reply_subject"],
-                        "body": result["reply_body"],
+                        "to_addr": result["mail_to"] or mail_info.get("from_addr", ""),
+                        "subject": result["mail_subject"],
+                        "body": result["mail_body"],
                     }
                     payload["account_name"], payload["to_addr"], payload["subject"], payload[
                         "body"
@@ -548,7 +886,7 @@ class MailProcessPlugin(Star):
                         )
                 except Exception as e:
                     logger.warning(f"MailProcess: auto reply failed: {e}")
-                    result["reply"] = False
+                    result["send_mail"] = False
                     result["reply_sent"] = False
                     result["notify"] = True
                     result["reason"] = f"AI 判断需要处理，但自动回复失败: {e}"
@@ -561,24 +899,33 @@ class MailProcessPlugin(Star):
         self, account: dict, mail_info: dict, ai_result: dict, unified_msg_origin: str
     ) -> str:
         persona_prompt = self._get_persona_prompt(unified_msg_origin)
+        begin_dialogs = self._get_persona_begin_dialogs(unified_msg_origin)
         account_name = account.get("name") or account.get("email") or "未命名账户"
         lines = [
-            "请像当前会话中的正常 AI 助手一样，向用户发送一条新消息。",
-            "你必须直接输出发给用户的正文，不要输出 JSON、代码块或额外解释。",
-            "这是一条由插件触发的邮件处理通知。",
-            f"邮箱账户: {account_name}",
-            f"邮件发件人: {mail_info['from_name']} <{mail_info['from_addr']}>",
-            f"邮件主题: {mail_info['subject']}",
-            f"邮件时间: {mail_info['date']}",
-            f"邮件正文摘要: {mail_info['body']}",
-            f"处理原因: {ai_result.get('reason', '')}",
+            "请直接以当前会话中的 AI 助手身份，给用户发送一条正常聊天消息。",
+            "你必须只输出发给用户的正文，不要输出 JSON、代码块、标题、小节或额外说明。",
+            "语气必须明显符合当前会话的人格设定，像平时聊天一样自然。",
+            "不要写成固定通知模板，不要逐项罗列“邮箱账户、发件人、主题、时间、摘要、处理建议”等标签。",
+            "你需要自然地告诉用户：刚收到一封新邮件，以及这封邮件的大致内容。",
+            "只有在确实有必要时，才自然提到发件人、主题或邮箱账户；不要机械复述所有字段。",
+            "如果这封邮件已经被自动回复，要自然告诉用户；如果没有自动回复，也只需自然带过，不要写成系统提示。",
         ]
-        if ai_result.get("reply_sent"):
-            lines.append("这封邮件已经被 AI 自动回复，请明确告诉用户这一点。")
-        else:
-            lines.append("这封邮件目前尚未自动回复。")
         if persona_prompt:
-            lines.append(f"请遵守当前会话人格设定: {persona_prompt}")
+            lines.append(f"当前会话人格设定: {persona_prompt}")
+        lines.extend(
+            [
+                f"当前邮箱账户: {account_name}",
+                f"邮件发件人: {mail_info['from_name']} <{mail_info['from_addr']}>",
+                f"邮件主题: {mail_info['subject']}",
+                f"邮件时间: {mail_info['date']}",
+                f"邮件大致内容: {mail_info['body']}",
+                f"本次处理原因: {ai_result.get('reason', '')}",
+                f"是否已自动回复: {'是' if ai_result.get('reply_sent') else '否'}",
+            ]
+        )
+        if begin_dialogs:
+            lines.append("当前会话说话风格参考:")
+            lines.extend(begin_dialogs[:8])
         return "\n".join(lines)
 
     def _build_conversation_mail_context(
@@ -633,11 +980,6 @@ class MailProcessPlugin(Star):
             if not unified_msg_origin or unified_msg_origin in sent:
                 continue
             try:
-                provider_id = await self.context.get_current_chat_provider_id(
-                    umo=unified_msg_origin
-                )
-                if not provider_id:
-                    raise ValueError("未找到聊天提供商")
                 prompt = self._build_ai_notify_prompt(
                     account, mail_info, ai_result, unified_msg_origin
                 )
@@ -666,33 +1008,78 @@ class MailProcessPlugin(Star):
                 )
             sent.add(unified_msg_origin)
 
-    def _build_confirm_message(self, request_id: str, payload: dict) -> str:
-        lines = [
-            "📨 AI 生成了一封待确认邮件",
-            f"请求ID: {request_id}",
-            f"账户: {payload['account_name']}",
-            f"收件人: {payload['to_addr']}",
-            f"主题: {payload['subject']}",
-            "正文:",
-            payload["body"],
-            "",
-            "回复 /mail_confirm " + request_id + " 发送",
-            "回复 /mail_reject " + request_id + " 取消",
-        ]
-        return "\n".join(lines)
-
-    async def _enqueue_confirmation(
-        self, event: AstrMessageEvent, payload: dict
+    def _create_pending_mail(
+        self, payload: dict, event: AstrMessageEvent | None = None
     ) -> str:
         request_id = uuid.uuid4().hex[:8]
-        self._pending_confirmations[request_id] = payload
-        chain = MessageChain().message(self._build_confirm_message(request_id, payload))
-        notify_targets = getattr(event, "notify_targets", None)
-        if isinstance(notify_targets, dict) and notify_targets:
-            await self._broadcast_message(notify_targets, chain)
-        else:
-            await self.context.send_message(event.unified_msg_origin, chain)
+        stored_payload = dict(payload)
+        if event is not None:
+            stored_payload["_owner_umo"] = getattr(event, "unified_msg_origin", "") or ""
+            stored_payload["_owner_uid"] = str(event.get_sender_id()).strip()
+        stored_payload["_created_at"] = datetime.now().isoformat()
+        self._pending_confirmations[request_id] = stored_payload
+        owner_umo = stored_payload.get("_owner_umo", "")
+        if owner_umo:
+            self._latest_pending_by_session[owner_umo] = request_id
         return request_id
+
+    def _pop_pending_mail(self, mail_id: str) -> dict | None:
+        normalized_mail_id = (mail_id or "").strip()
+        payload = self._pending_confirmations.pop(normalized_mail_id, None)
+        if not payload:
+            return None
+        owner_umo = str(payload.get("_owner_umo", "") or "").strip()
+        if owner_umo and self._latest_pending_by_session.get(owner_umo) == normalized_mail_id:
+            self._latest_pending_by_session.pop(owner_umo, None)
+        return payload
+
+    def _resolve_pending_mail_for_session(
+        self, event: AstrMessageEvent, mail_id: str
+    ) -> tuple[str | None, dict | None, str]:
+        requested_id = (mail_id or "").strip()
+        current_umo = getattr(event, "unified_msg_origin", "") or ""
+        current_uid = str(event.get_sender_id()).strip()
+
+        if requested_id:
+            payload = self._pending_confirmations.get(requested_id)
+            if payload:
+                owner_umo = str(payload.get("_owner_umo", "") or "").strip()
+                owner_uid = str(payload.get("_owner_uid", "") or "").strip()
+                if (not owner_umo or owner_umo == current_umo) and (
+                    not owner_uid or owner_uid == current_uid
+                ):
+                    return requested_id, payload, ""
+
+        latest_id = self._latest_pending_by_session.get(current_umo, "")
+        if latest_id:
+            payload = self._pending_confirmations.get(latest_id)
+            if payload:
+                owner_uid = str(payload.get("_owner_uid", "") or "").strip()
+                if not owner_uid or owner_uid == current_uid:
+                    note = ""
+                    if requested_id and requested_id != latest_id:
+                        note = "已忽略历史或无效 mail_id，改用当前会话最新待确认邮件。"
+                    return latest_id, payload, note
+
+        for pending_id, payload in reversed(list(self._pending_confirmations.items())):
+            if not isinstance(payload, dict):
+                continue
+            owner_umo = str(payload.get("_owner_umo", "") or "").strip()
+            owner_uid = str(payload.get("_owner_uid", "") or "").strip()
+            if owner_umo == current_umo and (not owner_uid or owner_uid == current_uid):
+                note = ""
+                if requested_id and requested_id != pending_id:
+                    note = "已忽略历史或无效 mail_id，改用当前会话待确认邮件。"
+                self._latest_pending_by_session[current_umo] = pending_id
+                return pending_id, payload, note
+
+        reason = (
+            "当前会话没有可确认的待发送邮件。"
+            "不要复用历史 mail_id。"
+            "如果用户现在是要新回复邮件或新发邮件，请先调用 send_mail(account_name, to_addr, subject, body)"
+            " 创建待确认草稿；只有在本轮已经生成草稿且用户明确同意后，才能调用 send_mail_confirm(mail_id)。"
+        )
+        return None, None, reason
 
     async def _send_mail_payload(self, payload: dict) -> tuple[str, dict]:
         account = self._get_account_by_name_or_email(payload["account_name"])
@@ -777,9 +1164,12 @@ class MailProcessPlugin(Star):
             name = acc.get("name") or addr
             status = self._account_status.get(addr, "⏳ 等待首次检查")
             last = self._last_check_time.get(addr, "尚未检查")
+            pending_count = await self._get_pending_count(addr)
             lines.append(f"📧 {name} ({addr})")
             lines.append(f"   状态: {status}")
             lines.append(f"   最近检查: {last}")
+            if pending_count > 0:
+                lines.append(f"   待处理邮件: {pending_count}")
 
         yield event.plain_result("\n".join(lines))
 
@@ -798,22 +1188,43 @@ class MailProcessPlugin(Star):
             return
 
         notify_targets = await self._get_admin_notify_targets()
-        if not notify_targets:
+        if notify_targets:
+            yield event.plain_result("🔍 正在检查所有邮箱...")
+        else:
             yield event.plain_result(
-                "❌ 当前没有可通知的管理员会话。\n请至少让一个管理员先给机器人发送一条消息。"
+                "🔍 正在检查所有邮箱...\n当前没有可通知的管理员会话，新邮件会先暂存，等管理员再次和机器人对话后补处理。"
             )
-            return
-        yield event.plain_result("🔍 正在检查所有邮箱...")
 
         # Manual check reuses the same account-checking path as the background loop.
         errors = []
+        pending_summary = []
         for account in accounts:
             if not account.get("email") or not account.get("imap_server"):
                 continue
             email_addr = account["email"]
             try:
-                await self._check_account(account, notify_targets)
-                self._account_status[email_addr] = "✅ 正常"
+                result = await self._check_account(account, notify_targets)
+                pending_count = int(result.get("pending_count", 0) or 0)
+                delivered_pending = int(
+                    result.get("delivered_pending_count", 0) or 0
+                )
+                if not notify_targets:
+                    if pending_count > 0:
+                        self._account_status[email_addr] = (
+                            f"⏸️ 已检测到 {pending_count} 封待处理邮件，等待管理员会话"
+                        )
+                    else:
+                        self._account_status[email_addr] = "✅ 已检查（当前无管理员会话）"
+                elif delivered_pending > 0:
+                    self._account_status[email_addr] = (
+                        f"✅ 正常（已补处理 {delivered_pending} 封待处理邮件）"
+                    )
+                else:
+                    self._account_status[email_addr] = "✅ 正常"
+                if pending_count > 0:
+                    pending_summary.append(
+                        f"{account.get('name') or email_addr}: {pending_count} 封待处理"
+                    )
             except Exception as e:
                 self._account_status[email_addr] = f"❌ {str(e)[:80]}"
                 errors.append(f"{account.get('name') or email_addr}: {e}")
@@ -823,103 +1234,13 @@ class MailProcessPlugin(Star):
 
         if errors:
             yield event.plain_result("⚠️ 部分邮箱检查失败:\n" + "\n".join(errors))
+        elif pending_summary and not notify_targets:
+            yield event.plain_result(
+                "✅ 所有邮箱检查完成。\n当前无管理员会话，以下邮件已暂存：\n"
+                + "\n".join(pending_summary)
+            )
         else:
             yield event.plain_result("✅ 所有邮箱检查完成。")
-
-    @filter.command("mail_query")
-    async def mail_query(
-        self, event: AstrMessageEvent, account_name: str, since_date: str
-    ):
-        await self._record_admin_session(event)
-        if not self._is_plugin_admin(event):
-            yield event.plain_result(self._get_admin_denied_message())
-            return
-        """查询指定邮箱自某日期以来的邮件，如 /mail_query qq邮箱 2026-03-01"""
-        accounts = self.config.get("mail_accounts", [])
-
-        # Resolve the target account by either display name or full email address.
-        target = None
-        for acc in accounts:
-            name = acc.get("name", "")
-            addr = acc.get("email", "")
-            if account_name in (name, addr):
-                target = acc
-                break
-        if not target:
-            yield event.plain_result(
-                f'❌ 未找到名为 "{account_name}" 的邮箱账户。\n'
-                f"已配置的账户: {', '.join(a.get('name') or a.get('email', '?') for a in accounts)}"
-            )
-            return
-
-        # The command accepts only YYYY-MM-DD to keep parsing deterministic.
-        try:
-            since_dt = datetime.strptime(since_date, "%Y-%m-%d")
-        except ValueError:
-            yield event.plain_result(
-                "❌ 日期格式错误，请使用 YYYY-MM-DD，如 2026-03-01"
-            )
-            return
-
-        yield event.plain_result(
-            f"🔍 正在查询 {account_name} 自 {since_date} 以来的邮件..."
-        )
-
-        try:
-            max_body_len = self.config.get("max_body_length", 500)
-            # History query also uses a worker thread because IMAP access is blocking.
-            emails = await asyncio.to_thread(
-                imap_query_since, target, since_dt, max_body_len
-            )
-        except Exception as e:
-            yield event.plain_result(f"❌ 查询失败: {e}")
-            return
-
-        if not emails:
-            yield event.plain_result(
-                f"📭 {account_name} 自 {since_date} 以来没有邮件。"
-            )
-            return
-
-        lines = [
-            f"📬 {account_name} 自 {since_date} 以来共 {len(emails)} 封邮件：",
-            "━━━━━━━━━━━━━━━━",
-        ]
-        for i, m in enumerate(emails, 1):
-            lines.append(f"{i}. 📋 {m['subject']}")
-            lines.append(f"   📤 {m['from_name']}  🕐 {m['date']}")
-        yield event.plain_result("\n".join(lines))
-
-    @filter.command("mail_confirm")
-    async def mail_confirm(self, event: AstrMessageEvent, request_id: str):
-        await self._record_admin_session(event)
-        if not self._is_plugin_admin(event):
-            yield event.plain_result(self._get_admin_denied_message())
-            return
-        payload = self._pending_confirmations.pop(request_id.strip(), None)
-        if not payload:
-            yield event.plain_result("❌ 未找到待确认的邮件请求。")
-            return
-        try:
-            account_display, _ = await self._send_mail_payload(payload)
-        except Exception as e:
-            yield event.plain_result(f"❌ 发送失败: {e}")
-            return
-        yield event.plain_result(
-            f"✅ 发送成功\n账户: {account_display}\n收件人: {payload['to_addr']}\n主题: {payload['subject']}"
-        )
-
-    @filter.command("mail_reject")
-    async def mail_reject(self, event: AstrMessageEvent, request_id: str):
-        await self._record_admin_session(event)
-        if not self._is_plugin_admin(event):
-            yield event.plain_result(self._get_admin_denied_message())
-            return
-        removed = self._pending_confirmations.pop(request_id.strip(), None)
-        if not removed:
-            yield event.plain_result("❌ 未找到待确认的邮件请求。")
-            return
-        yield event.plain_result("✅ 已取消该邮件发送请求。")
 
     @filter.llm_tool(name="notify_mail_admin")
     async def notify_mail_admin(self, event: AstrMessageEvent, reason: str = ""):
@@ -936,8 +1257,127 @@ class MailProcessPlugin(Star):
             "reason": final_reason,
         }
 
-    @filter.llm_tool(name="send_mail_reply")
-    async def send_mail_reply(
+    @filter.llm_tool(name="mail_query")
+    async def mail_query(
+        self,
+        event: AstrMessageEvent,
+        account_name: str = "",
+        page: int = 1,
+        page_size: int = 0,
+    ):
+        """查询指定邮箱最近邮件列表，只返回简短摘要，支持分页。
+
+        Args:
+            account_name(string): 邮箱账户名或邮箱地址；若仅配置了一个邮箱，可留空
+            page(int): 页码，从 1 开始
+            page_size(int): 每页数量；传 0 时使用配置默认值
+        """
+        if not self._is_plugin_admin(event):
+            return {"ok": False, "reason": self._get_admin_denied_message()}
+
+        account, error = self._resolve_account_for_query(account_name, allow_default=True)
+        if not account:
+            return {"ok": False, "reason": error}
+
+        max_items = self._get_mail_query_max_items()
+        default_page_size = self._get_mail_query_page_size()
+        safe_page_size = int(page_size or default_page_size)
+        safe_page_size = max(1, min(safe_page_size, 20))
+        safe_page = max(int(page or 1), 1)
+
+        preview_len = min(int(self.config.get("mail_query_preview_length", 120) or 120), 300)
+        preview_len = max(preview_len, 20)
+
+        try:
+            emails = await asyncio.to_thread(
+                imap_query_recent,
+                account,
+                preview_len,
+                max_items,
+            )
+        except Exception as e:
+            return {"ok": False, "reason": f"查询邮件失败: {e}"}
+
+        total = len(emails)
+        total_pages = max((total + safe_page_size - 1) // safe_page_size, 1)
+        if safe_page > total_pages:
+            return {
+                "ok": False,
+                "reason": f"页码超出范围。当前共有 {total_pages} 页。",
+            }
+
+        start = (safe_page - 1) * safe_page_size
+        end = start + safe_page_size
+        page_items = [self._normalize_mail_preview(item) for item in emails[start:end]]
+        account_display = account.get("name") or account.get("email") or ""
+
+        return {
+            "ok": True,
+            "account_name": account_display,
+            "account_email": account.get("email") or "",
+            "page": safe_page,
+            "page_size": safe_page_size,
+            "total": total,
+            "total_pages": total_pages,
+            "max_items": max_items,
+            "items": page_items,
+            "reason": "如需查看某封邮件完整内容，请调用 mail_read(account_name, mail_uid)。",
+        }
+
+    @filter.llm_tool(name="mail_read")
+    async def mail_read(
+        self,
+        event: AstrMessageEvent,
+        account_name: str,
+        mail_uid: int,
+    ):
+        """读取指定邮箱中某封邮件的详细内容。
+
+        Args:
+            account_name(string): 邮箱账户名或邮箱地址
+            mail_uid(int): 目标邮件 UID，可从 mail_query 返回结果中获取
+        """
+        if not self._is_plugin_admin(event):
+            return {"ok": False, "reason": self._get_admin_denied_message()}
+
+        account, error = self._resolve_account_for_query(account_name, allow_default=False)
+        if not account:
+            return {"ok": False, "reason": error}
+
+        try:
+            safe_uid = int(mail_uid)
+        except Exception:
+            return {"ok": False, "reason": "mail_uid 必须是有效整数。"}
+        if safe_uid <= 0:
+            return {"ok": False, "reason": "mail_uid 必须大于 0。"}
+
+        body_len = max(int(self.config.get("mail_read_body_length", 4000) or 4000), 200)
+        body_len = min(body_len, 20000)
+
+        try:
+            mail_info = await asyncio.to_thread(imap_read_uid, account, safe_uid, body_len)
+        except Exception as e:
+            return {"ok": False, "reason": f"读取邮件失败: {e}"}
+
+        if not mail_info:
+            return {"ok": False, "reason": f"未找到 UID 为 {safe_uid} 的邮件。"}
+
+        return {
+            "ok": True,
+            "account_name": account.get("name") or account.get("email") or "",
+            "account_email": account.get("email") or "",
+            "mail": {
+                "uid": int(mail_info.get("uid", 0) or 0),
+                "subject": str(mail_info.get("subject", "") or "").strip(),
+                "from_name": str(mail_info.get("from_name", "") or "").strip(),
+                "from_addr": str(mail_info.get("from_addr", "") or "").strip(),
+                "date": str(mail_info.get("date", "") or "").strip(),
+                "body": str(mail_info.get("body", "") or "").strip(),
+            },
+        }
+
+    @filter.llm_tool(name="send_mail")
+    async def send_mail(
         self,
         event: AstrMessageEvent,
         account_name: str,
@@ -945,7 +1385,7 @@ class MailProcessPlugin(Star):
         subject: str,
         body: str,
     ):
-        """发送邮件。
+        """创建一封待确认邮件草稿。
 
         Args:
             account_name(string): 发送所用邮箱账户名或邮箱地址
@@ -953,20 +1393,22 @@ class MailProcessPlugin(Star):
             subject(string): 邮件主题
             body(string): 邮件正文
         """
-        if not self.config.get("ai_allow_reply", True):
-            return {"reply": False, "reason": "配置已禁用 AI 回复"}
+        if not self._is_plugin_admin(event):
+            return {"ok": False, "reason": self._get_admin_denied_message()}
+        if not self._is_send_mail_allowed():
+            return {"ok": False, "reason": "配置已禁用 AI 发信"}
         try:
             account_name, to_addr, subject, body = self._validate_reply_payload(
                 account_name, to_addr, subject, body
             )
         except ValueError as e:
-            return {"reply": False, "reason": str(e)}
+            return {"ok": False, "reason": str(e)}
 
         account = self._get_account_by_name_or_email(account_name)
         if not account:
-            return {"reply": False, "reason": f"未找到邮箱账户: {account_name}"}
+            return {"ok": False, "reason": f"未找到邮箱账户: {account_name}"}
         if not account.get("smtp_server"):
-            return {"reply": False, "reason": "目标账户未配置 SMTP，无法回复"}
+            return {"ok": False, "reason": "目标账户未配置 SMTP，无法发信"}
 
         payload = {
             "account_name": account_name,
@@ -974,12 +1416,59 @@ class MailProcessPlugin(Star):
             "subject": subject,
             "body": body,
         }
-        request_id = await self._enqueue_confirmation(event, payload)
+        mail_id = self._create_pending_mail(payload, event)
         return {
-            "reply": True,
-            "notify": False,
-            "reason": f"已创建待确认邮件，请管理员使用 /mail_confirm {request_id} 或 /mail_reject {request_id}",
+            "ok": True,
+            "mail_id": mail_id,
+            "account_name": account_name,
+            "to_addr": to_addr,
+            "subject": subject,
+            "body": body,
+            "status": "pending_confirmation",
+            "reason": "已创建当前会话的待确认邮件草稿。请你先用自然语言向用户确认是否发送；只有在用户明确同意后，才能调用 send_mail_confirm(mail_id)。不要复用历史 mail_id。",
         }
+
+    @filter.llm_tool(name="send_mail_confirm")
+    async def send_mail_confirm(self, event: AstrMessageEvent, mail_id: str):
+        """确认并发送当前会话中刚创建的待确认邮件。
+
+        Args:
+            mail_id(string): 待确认邮件 ID。仅用于本会话中刚通过 send_mail 返回的 mail_id，不要复用历史 mail_id。
+        """
+        if not self._is_plugin_admin(event):
+            return {"ok": False, "reason": self._get_admin_denied_message()}
+        if not self._is_send_mail_allowed():
+            return {"ok": False, "reason": "配置已禁用 AI 发信"}
+
+        resolved_mail_id, payload, resolution_note = self._resolve_pending_mail_for_session(
+            event, mail_id
+        )
+        if not payload or not resolved_mail_id:
+            return {"ok": False, "reason": resolution_note}
+
+        try:
+            payload = self._pop_pending_mail(resolved_mail_id)
+            if not payload:
+                return {
+                    "ok": False,
+                    "reason": "待确认邮件已不存在，可能已发送、已取消或已过期。若需要重新发送，请先重新调用 send_mail 创建新草稿。",
+                }
+            account_display, _ = await self._send_mail_payload(payload)
+        except Exception as e:
+            return {"ok": False, "reason": f"发送失败: {e}"}
+
+        result = {
+            "ok": True,
+            "mail_id": resolved_mail_id,
+            "status": "sent",
+            "account_name": account_display,
+            "to_addr": payload["to_addr"],
+            "subject": payload["subject"],
+            "reason": "邮件已发送。",
+        }
+        if resolution_note:
+            result["resolution_note"] = resolution_note
+        return result
 
     # ── Lifecycle ────────────────────────────────────────────────
 

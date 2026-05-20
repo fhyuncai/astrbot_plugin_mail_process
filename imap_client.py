@@ -264,3 +264,80 @@ def imap_query_since(
             pass
 
     return results
+
+
+def imap_query_recent(
+    account: dict,
+    preview_body_len: int,
+    limit: int = 50,
+) -> list[dict]:
+    """查询指定邮箱最近若干封邮件，按时间倒序返回。
+
+    Args:
+        account: 账户配置字典。
+        preview_body_len: 查询列表中正文摘要的最大长度。
+        limit: 返回最近多少封邮件。
+
+    Returns:
+        最近邮件列表，按最新到最旧排序。
+    """
+    conn = _connect(account)
+    results: list[dict] = []
+    safe_limit = max(int(limit or 0), 1)
+
+    try:
+        status, data = conn.uid("search", "ALL")
+        if status != "OK" or not data[0]:
+            return []
+
+        uid_list = data[0].split()
+        selected_uids = list(reversed(uid_list[-safe_limit:]))
+        for uid in selected_uids:
+            status, msg_data = conn.uid("fetch", uid, "(RFC822)")
+            if status != "OK" or not msg_data or not msg_data[0]:
+                continue
+            raw = msg_data[0][1]
+            if not isinstance(raw, bytes):
+                continue
+            msg = email_lib.message_from_bytes(raw)
+            results.append(_parse_email(msg, uid, preview_body_len, preview_body_len))
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+    return results
+
+
+def imap_read_uid(
+    account: dict,
+    mail_uid: int,
+    body_len: int,
+) -> dict | None:
+    """按 UID 读取指定邮件正文。
+
+    Args:
+        account: 账户配置字典。
+        mail_uid: 目标邮件 UID。
+        body_len: 正文最大长度。
+
+    Returns:
+        邮件信息字典；找不到时返回 None。
+    """
+    conn = _connect(account)
+    try:
+        uid_bytes = str(int(mail_uid)).encode()
+        status, msg_data = conn.uid("fetch", uid_bytes, "(RFC822)")
+        if status != "OK" or not msg_data or not msg_data[0]:
+            return None
+        raw = msg_data[0][1]
+        if not isinstance(raw, bytes):
+            return None
+        msg = email_lib.message_from_bytes(raw)
+        return _parse_email(msg, uid_bytes, body_len, body_len)
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass

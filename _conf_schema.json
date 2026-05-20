@@ -97,7 +97,7 @@
   "ai_processing_prompt": {
     "description": "AI 邮件处理提示词",
     "type": "string",
-    "default": "你收到了一封新邮件，请阅读后决定是否回复或通知。",
+    "default": "你收到了一封新邮件，不要回复，请阅读后决定是否通知，如果是广告邮件或垃圾邮件请直接忽略。",
     "hint": "会和邮件主题、发件人、正文等上下文一起发送给 AI"
   },
   "ai_allow_notify": {
@@ -106,11 +106,11 @@
     "default": true,
     "hint": "开启后，AI 可以决定将邮件通知发给管理员"
   },
-  "ai_allow_reply": {
-    "description": "允许 AI 发起回复",
+  "ai_allow_send_mail": {
+    "description": "允许 AI 发送邮件",
     "type": "bool",
     "default": true,
-    "hint": "开启后，AI 可以生成待确认的邮件回复，管理员确认后才会发送"
+    "hint": "开启后，AI 可以发送邮件；自动处理新邮件时可自动回复，聊天场景下需先询问并确认"
   },
   "blacklist_settings": {
     "description": "黑名单设置",
@@ -183,5 +183,29 @@
     "type": "int",
     "default": 3000,
     "hint": "用于正文黑白名单匹配的最大字符数"
+  },
+  "mail_query_max_items": {
+    "description": "AI 查询邮件最大条数",
+    "type": "int",
+    "default": 50,
+    "hint": "mail_query 工具最多会读取最近多少封邮件，建议不高于 100"
+  },
+  "mail_query_page_size": {
+    "description": "AI 查询默认每页条数",
+    "type": "int",
+    "default": 10,
+    "hint": "mail_query 工具默认每页返回多少封邮件，最大 20"
+  },
+  "mail_query_preview_length": {
+    "description": "AI 查询摘要长度",
+    "type": "int",
+    "default": 120,
+    "hint": "mail_query 返回的邮件摘要最大长度，避免列表过长"
+  },
+  "mail_read_body_length": {
+    "description": "AI 读信正文最大长度",
+    "type": "int",
+    "default": 4000,
+    "hint": "mail_read 返回的正文最大长度，避免单封邮件过长"
   }
 }
